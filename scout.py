@@ -80,8 +80,8 @@ def past_topics(cfg: dict) -> list[str]:
     return seen
 
 
-def gdoc_lines(cfg: dict) -> list[str]:
-    """Current topic lines from the source-of-truth gdoc (below the divider)."""
+def _gdoc_topic_paragraphs(cfg: dict) -> list[tuple[int, str]]:
+    """(startIndex, text) for every non-empty paragraph below the divider."""
     doc_id = cfg["scout"]["topic_doc_id"]
     proc = subprocess.run(
         ["/opt/homebrew/bin/gws", "docs", "documents", "get",
@@ -90,7 +90,7 @@ def gdoc_lines(cfg: dict) -> list[str]:
     if proc.returncode != 0:
         raise RuntimeError(f"gws docs get failed: {proc.stderr[-300:]}")
     doc = json.loads(proc.stdout)
-    lines, past_divider = [], False
+    out, past_divider = [], False
     for el in doc.get("body", {}).get("content", []):
         if "paragraph" not in el:
             continue
@@ -100,8 +100,46 @@ def gdoc_lines(cfg: dict) -> list[str]:
             past_divider = True
             continue
         if past_divider and text:
-            lines.append(text)
-    return lines
+            out.append((el["startIndex"], text))
+    return out
+
+
+def gdoc_lines(cfg: dict) -> list[str]:
+    """Current topic lines from the source-of-truth gdoc (below the divider)."""
+    return [text for _, text in _gdoc_topic_paragraphs(cfg)]
+
+
+def gdoc_insert(cfg: dict, line: str, before_line: str | None = None) -> str:
+    """Add a topic line to the gdoc queue.
+
+    before_line None → append at the end (gws +write helper). Otherwise insert
+    the new line (plus a blank paragraph, matching the doc's spacing) at the
+    startIndex of the named existing line, so it takes that line's position.
+    """
+    line = " ".join(line.split())
+    if before_line:
+        for idx, text in _gdoc_topic_paragraphs(cfg):
+            if text == before_line:
+                body = {"requests": [{"insertText": {
+                    "location": {"index": idx}, "text": line + "\n\n"}}]}
+                proc = subprocess.run(
+                    ["/opt/homebrew/bin/gws", "docs", "documents", "batchUpdate",
+                     "--params", json.dumps(
+                         {"documentId": cfg["scout"]["topic_doc_id"]}),
+                     "--json", json.dumps(body)],
+                    capture_output=True, text=True, timeout=60)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"gdoc insert failed: {proc.stderr[-300:]}")
+                return f"inserted before “{before_line[:50]}”"
+        # target line vanished (doc edited meanwhile) — fall through to append
+    proc = subprocess.run(
+        ["/opt/homebrew/bin/gws", "docs", "+write",
+         "--document", cfg["scout"]["topic_doc_id"],
+         "--text", f"\n{line}\n"],
+        capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(f"gdoc append failed: {proc.stderr[-300:]}")
+    return "appended to the end of the queue"
 
 
 # --------------------------------------------------------------------- llm --

@@ -99,8 +99,36 @@ def _mark_processed(script: Path) -> str:
     return f"moved {script.name} to processed/"
 
 
-def dispatch(name: str, arg: str) -> str:
+def dispatch(name: str, arg: str, form: dict | None = None) -> str:
     """Start (or run) one whitelisted action; returns a short ack string."""
+    global _UPCOMING_CACHE
+    if name == "add_topic":
+        line = " ".join((arg or "").split())[:200]
+        if len(line) < 8:
+            return _record(name, arg, "failed", "topic text too short")
+        pos_raw = (form or {}).get("pos", [""])[0].strip()
+        before = None
+        if pos_raw:
+            try:
+                pos = int(pos_raw)
+            except ValueError:
+                return _record(name, arg, "failed",
+                               f"position must be a number, got {pos_raw!r}")
+            try:
+                upcoming, _ = upcoming_topics()
+            except Exception as exc:
+                return _record(name, arg, "failed",
+                               f"could not read topics doc: {exc}")
+            if 1 <= pos <= len(upcoming):
+                before = upcoming[pos - 1]
+            # position past the end just appends
+        import scout
+        try:
+            msg = scout.gdoc_insert(CFG, line, before_line=before)
+        except Exception as exc:
+            return _record(name, arg, "failed", str(exc))
+        _UPCOMING_CACHE = None  # show the new line on the next page load
+        return _record(name, arg, "done", msg)
     pods, clawd = CFG["podcasts_root"], Path.home() / "clawd"
     uploader = ["/opt/homebrew/bin/python3", str(pods / "scripts" / "upload_spotify.py")]
     producer = [str(clawd / ".venv" / "bin" / "python3"),
@@ -160,7 +188,6 @@ def dispatch(name: str, arg: str) -> str:
         if busy:
             return _record(name, arg, "failed",
                            "a script generation is already running — wait for it")
-        global _UPCOMING_CACHE
         _UPCOMING_CACHE = None  # the line is about to become covered
         return _spawn(name, arg,
                       [str(Path(CFG["factory"]["python"]).expanduser()),
@@ -363,6 +390,9 @@ CSS = """
      padding:.6rem;overflow-x:auto;font-size:12px;line-height:1.45}
  button{font:inherit;padding:.3rem .7rem;border:1px solid #b9bec6;
      border-radius:6px;background:#f4f5f7;cursor:pointer}
+ input:not([type=hidden]){font:inherit;padding:.25rem .5rem;
+     border:1px solid #b9bec6;border-radius:6px;background:transparent;
+     color:inherit}
  button:hover{border-color:#6a7f99}
  form{display:inline;margin-right:.4rem}
  details{margin:.5rem 0} summary{cursor:pointer}
@@ -508,6 +538,15 @@ def render_page() -> str:
 Topics doc</a>, in order — the top uncovered line is what the 5 AM task (or the
 Script Factory failover) produces next. {esc(upcoming_note)}</p>
 <table>{upcoming_html}</table>
+<form method="post" action="action" style="margin:.6rem 0">
+<input type="hidden" name="name" value="add_topic">
+<input name="arg" size="44" maxlength="200" required
+ placeholder="new-topic — angle, angle, angle">
+ at position <input name="pos" size="3" inputmode="numeric" placeholder="end">
+ <button>Add to queue</button>
+<br><small class="muted">Position = row number above (1 = next up); leave blank
+to add at the end. Writes straight into the topics doc.</small>
+</form>
 
 <h2>Topic Scout</h2>
 <p class="muted">Proposals from the nightly scan; approving appends the topic
@@ -577,7 +616,7 @@ class Handler(BaseHTTPRequestHandler):
         form = urllib.parse.parse_qs(self.rfile.read(length).decode())
         name = (form.get("name") or [""])[0]
         arg = (form.get("arg") or [""])[0]
-        dispatch(name, arg)
+        dispatch(name, arg, form)
         self._send(b"", "text/plain", 303, {"Location": "."})
 
     def log_message(self, fmt, *args):
