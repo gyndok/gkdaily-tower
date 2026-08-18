@@ -238,6 +238,19 @@ def _spawn(name, arg, argv, timeout) -> str:
         c.commit()
         c.close()
         log.info("action %s finished: %s", name, status)
+        if name == "produce_topic" and status != "done":
+            # The button must never fail silently — surface the root cause
+            # (last traceback line carries it, e.g. the credit-balance error).
+            try:
+                import tower
+                root = (output.strip().splitlines() or ["no output"])[-1][:300]
+                tower.telegram(CFG,
+                    f"❌ GK Daily: on-demand production FAILED\n"
+                    f"Topic: {arg}\n{root}\n\n"
+                    "The topic is still in the queue — fix the cause and "
+                    "click Produce now again.")
+            except Exception:
+                log.warning("failure alert could not be sent", exc_info=True)
 
     threading.Thread(target=run, daemon=True).start()
     return "running"
