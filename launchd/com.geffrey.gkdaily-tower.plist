@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.geffrey.gkdaily-tower</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/geffreyklein/gkdaily-tower/tower.py</string>
+        <string>--serve</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/geffreyklein/gkdaily-tower</string>
+
+    <!-- Always-on supervisor: restart on any exit, start at login. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TZ</key>
+        <string>America/Chicago</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/geffreyklein/Library/Logs/gkdaily-tower.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/geffreyklein/Library/Logs/gkdaily-tower.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
