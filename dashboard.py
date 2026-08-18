@@ -140,6 +140,32 @@ def dispatch(name: str, arg: str) -> str:
                       [str(Path(CFG["factory"]["python"]).expanduser()),
                        str(Path(__file__).resolve().parent / "factory.py"),
                        "--run", "--stage"], 1800)
+    if name == "produce_topic":
+        # Full pipeline kickoff: Factory writes the script for this exact
+        # queue line → Drive → the WatchPaths producer renders and uploads.
+        try:
+            upcoming, _ = upcoming_topics()
+        except Exception as exc:
+            return _record(name, arg, "failed", f"could not read topics doc: {exc}")
+        if arg not in upcoming:
+            # Only lines currently in the queue are producible — stops stale
+            # pages, double-clicks on covered topics, and arbitrary input.
+            return _record(name, arg, "failed",
+                           "not an uncovered line in the current queue")
+        conn = sqlite3.connect(DB_PATH)
+        busy = conn.execute(
+            "SELECT COUNT(*) FROM actions WHERE status='running' "
+            "AND name IN ('produce_topic','run_factory_staged')").fetchone()[0]
+        conn.close()
+        if busy:
+            return _record(name, arg, "failed",
+                           "a script generation is already running — wait for it")
+        global _UPCOMING_CACHE
+        _UPCOMING_CACHE = None  # the line is about to become covered
+        return _spawn(name, arg,
+                      [str(Path(CFG["factory"]["python"]).expanduser()),
+                       str(Path(__file__).resolve().parent / "factory.py"),
+                       "--run", "--topic", arg], 1800)
     if name in ("approve_topic", "veto_topic"):
         import scout
         try:
@@ -388,13 +414,18 @@ def render_page() -> str:
         upcoming, done_count = upcoming_topics()
         upcoming_html = "".join(
             f'<tr><td class="muted" style="width:2rem">{i}</td>'
-            f'<td>{esc(l)}{" <span class=tag>next up</span>" if i == 1 else ""}</td></tr>'
+            f'<td>{esc(l)}{" <span class=tag>next up</span>" if i == 1 else ""}</td>'
+            f'<td style="width:8rem">'
+            + button("Produce now", "produce_topic", l,
+                     "Write, render, and publish this episode to Spotify now? "
+                     "Costs about $1 and takes ~20 minutes end to end.")
+            + "</td></tr>"
             for i, l in enumerate(upcoming, 1)) or \
-            '<tr><td colspan="2" class="muted">queue is empty — approve some Scout proposals</td></tr>'
+            '<tr><td colspan="3" class="muted">queue is empty — approve some Scout proposals</td></tr>'
         upcoming_note = (f"{len(upcoming)} queued · {done_count} line(s) in the "
                          "doc already produced")
     except Exception as exc:
-        upcoming_html = (f'<tr><td colspan="2" class="muted">could not read the '
+        upcoming_html = (f'<tr><td colspan="3" class="muted">could not read the '
                          f'topics doc: {esc(exc)}</td></tr>')
         upcoming_note = ""
 

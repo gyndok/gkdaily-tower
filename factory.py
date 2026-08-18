@@ -224,14 +224,27 @@ def deliver(cfg: dict, topic: dict, script: str, stage: bool) -> Path:
     return out
 
 
-def run(cfg: dict, stage: bool = False) -> str:
-    topic = pick_topic(cfg)
+def run(cfg: dict, stage: bool = False, topic_line: str | None = None) -> str:
+    if topic_line:
+        # Explicit topic (dashboard "Produce now" button). Refuse anything
+        # already covered so a stale page can't double-produce an episode.
+        if is_covered(topic_line, covered_topics(cfg)):
+            raise RuntimeError(f"topic already covered/produced: {topic_line!r}")
+        topic = {"line": topic_line, "slug": slug_for(topic_line),
+                 "source": "dashboard"}
+    else:
+        topic = pick_topic(cfg)
     log.info("topic [%s]: %s", topic["source"], topic["line"])
     if not stage:
-        tower.telegram(cfg,
-            "🏭 GK Daily Script Factory engaged — no script arrived by "
-            f"{cfg['factory']['failover_at']}, generating one on the mini.\n"
-            f"Topic ({topic['source']}): {topic['line']}")
+        if topic["source"] == "dashboard":
+            tower.telegram(cfg,
+                "🏭 GK Daily Script Factory: producing on demand.\n"
+                f"Topic: {topic['line']}")
+        else:
+            tower.telegram(cfg,
+                "🏭 GK Daily Script Factory engaged — no script arrived by "
+                f"{cfg['factory']['failover_at']}, generating one on the mini.\n"
+                f"Topic ({topic['source']}): {topic['line']}")
     script = generate(cfg, topic)
     out = deliver(cfg, topic, script, stage)
     words = len(script.split())
@@ -300,6 +313,9 @@ def main() -> int:
     g.add_argument("--run", action="store_true")
     ap.add_argument("--stage", action="store_true",
                     help="with --run: write to staging/, not Drive; no Telegram")
+    ap.add_argument("--topic", metavar="LINE",
+                    help="with --run: produce this exact queue line instead of "
+                         "auto-picking the top uncovered topic")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -310,7 +326,7 @@ def main() -> int:
         topic = pick_topic(cfg)
         print(json.dumps(topic, indent=2, ensure_ascii=False))
         return 0
-    print(run(cfg, stage=args.stage))
+    print(run(cfg, stage=args.stage, topic_line=args.topic))
     return 0
 
 
