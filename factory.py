@@ -137,6 +137,9 @@ Formatting rules (the file is spoken by TTS):
 - Spell out abbreviations on first use ("reverse osmosis, or RO").
 - No markdown headers in the body, no bullet points, no parenthetical asides — \
 everything flows as natural speech.
+- Never lean on stock transition phrases — in particular the literal phrases \
+"why it matters" / "why this matters" / "why that matters" must not appear; \
+convey significance with varied, natural wording each time.
 - Target ~{words} words of spoken body (the renderer plays at 1.2x; that is \
 about 15 minutes of listening).
 - End the file with a `--- SOURCES ---` line followed by the key URLs used \
