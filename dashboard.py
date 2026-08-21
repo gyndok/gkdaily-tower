@@ -200,6 +200,26 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
             return _record(name, arg, "done", fn(CFG, arg))
         except Exception as exc:
             return _record(name, arg, "failed", str(exc))
+    if name == "batch_topics":
+        # Checkbox form: approve/veto every checked Scout proposal in one go.
+        slugs = (form or {}).get("slugs", [])
+        verdict = (form or {}).get("verdict", [""])[0]
+        if verdict not in ("approve", "veto"):
+            return _record(name, arg, "failed", f"unknown verdict {verdict!r}")
+        if not slugs:
+            return _record(name, verdict, "failed", "no topics selected")
+        import scout
+        fn = scout.approve if verdict == "approve" else scout.veto
+        results = []
+        for slug in slugs:
+            try:
+                results.append(f"{slug}: {fn(CFG, slug)}")
+            except Exception as exc:
+                results.append(f"{slug}: FAILED — {exc}")
+        _UPCOMING_CACHE = None
+        ok = not any("FAILED" in r for r in results)
+        return _record(name, f"{verdict} ×{len(slugs)}",
+                       "done" if ok else "failed", "\n".join(results))
     return _record(name, arg, "failed", "unknown action")
 
 
@@ -474,14 +494,23 @@ def render_page() -> str:
 
     topics = topic_candidates()
     prop_rows = "".join(
-        f'<tr><td><b>{esc(c["title"])}</b><br>{esc(c["angle"])}<br>'
+        f'<tr><td style="width:1.6rem;vertical-align:middle">'
+        f'<input type="checkbox" name="slugs" value="{esc(c["slug"])}"></td>'
+        f'<td><b>{esc(c["title"])}</b><br>{esc(c["angle"])}<br>'
         f'<span class="muted">{esc(c.get("why_now", ""))}</span><br>'
-        f'<span class="tag">{esc(c["queue_line"])}</span></td>'
-        f'<td>{button("Approve → topics doc", "approve_topic", c["slug"], "Append to the GK Daily Topics doc: " + c["queue_line"] + "?")}'
-        f'{button("Veto", "veto_topic", c["slug"])}</td></tr>'
+        f'<span class="tag">{esc(c["queue_line"])}</span></td></tr>'
         for c in topics["proposed"]) or \
         '<tr><td colspan="2" class="muted">no proposals waiting — Scout runs nightly at ' \
         + esc(CFG["scout"]["run_at"]) + '</td></tr>'
+    batch_controls = (
+        '<p><label class="muted"><input type="checkbox" onclick="'
+        "document.querySelectorAll('input[name=slugs]')"
+        '.forEach(c=>c.checked=this.checked)"> select all</label> &nbsp;'
+        '<button name="verdict" value="approve" onclick="'
+        "return confirm('Append the selected topics to the GK Daily Topics doc?')"
+        '">Approve selected → topics doc</button> '
+        '<button name="verdict" value="veto">Veto selected</button></p>'
+    ) if topics["proposed"] else ""
     decided_rows = "".join(
         f'<tr><td>{esc((c.get("decided_at") or "")[:16].replace("T", " "))}</td>'
         f'<td>{esc(c["status"])}{" (auto)" if c.get("decided_by") == "auto" else ""}</td>'
@@ -565,7 +594,11 @@ to add at the end. Writes straight into the topics doc.</small>
 <p class="muted">Proposals from the nightly scan; approving appends the topic
 to the <a href="{esc(CFG.get("topic_queue_doc", "#"))}">GK Daily Topics doc</a>
 (source of truth). {button("Run Scout now", "run_scout")}</p>
+<form method="post" action="action">
+<input type="hidden" name="name" value="batch_topics">
 <table>{prop_rows}</table>
+{batch_controls}
+</form>
 <details><summary>recent decisions</summary>
 <table>{decided_rows or ""}</table></details>
 
