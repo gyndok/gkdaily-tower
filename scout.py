@@ -145,8 +145,9 @@ def gdoc_insert(cfg: dict, line: str, before_line: str | None = None) -> str:
 # --------------------------------------------------------------------- llm --
 
 PROMPT = """You are the topic scout for "GK Daily Special Edition", a daily \
-12–15 minute researched explainer podcast. The host is an OBGYN physician; \
-the audience is curious generalists. House style: "how does X actually work" \
+12–15 minute researched explainer podcast narrated in a reporter's voice. The \
+show's owner is an OBGYN physician (so medical topics get clinical rigor); the \
+audience is curious generalists. House style: "how does X actually work" \
 deep dives on infrastructure, energy, medicine, economics, technology, and \
 science — sparked by the news but NOT news recaps; each episode should still \
 be worth hearing in a year. Medical topics get clinical rigor.
