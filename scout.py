@@ -176,6 +176,31 @@ ALREADY QUEUED:
 """
 
 
+def _extract_candidates(content: str) -> list[dict]:
+    """Parse the model's JSON; if it is truncated, salvage the complete
+    candidate objects rather than failing the whole run."""
+    content = re.sub(r"^```(json)?|```$", "", content.strip(), flags=re.M).strip()
+    try:
+        data = json.loads(content)
+        cands = data.get("candidates", data) if isinstance(data, dict) else data
+        if isinstance(cands, list):
+            return [c for c in cands if isinstance(c, dict)]
+    except json.JSONDecodeError:
+        pass
+    salvaged = []
+    for block in re.findall(r"\{[^{}]*\}", content):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("title"):
+            salvaged.append(obj)
+    if salvaged:
+        log.warning("model JSON was malformed/truncated; salvaged %d candidate(s)",
+                    len(salvaged))
+    return salvaged
+
+
 def propose(cfg: dict, headlines: dict, past: list, queued: list) -> list[dict]:
     creds = tower.load_env_creds(Path(cfg["scout"]["minibot_env"]).expanduser())
     api_key = creds.get("KIMI_API_KEY")
@@ -183,55 +208,56 @@ def propose(cfg: dict, headlines: dict, past: list, queued: list) -> list[dict]:
         raise RuntimeError("KIMI_API_KEY not found in minibot .env")
     base = creds.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
 
-    body = {
-        "model": cfg["scout"]["model"],
-        # no temperature: kimi-k2.6 rejects anything but the default (1).
-        # k2.6 is a reasoning model: reasoning_content counts toward
-        # max_tokens, so leave generous headroom or content comes back empty.
-        "max_tokens": 12000,
-        "response_format": {"type": "json_object"},
-        "messages": [{
-            "role": "user",
-            "content": PROMPT.format(
+    last_error = None
+    for attempt in (1, 2, 3):
+        # Attempt 2+ shrinks the input in case size was the problem.
+        per_feed = 12 if attempt == 1 else 6
+        hl = {k: v[:per_feed] for k, v in headlines.items()}
+        body = {
+            "model": cfg["scout"]["model"],
+            # kimi-k2.6 is a reasoning model; for this structured-output task
+            # thinking only burns the token budget (empty/truncated JSON on
+            # 2026-08-19 and 08-21). Moonshot honors thinking: disabled.
+            "thinking": {"type": "disabled"},
+            "max_tokens": 8000,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": PROMPT.format(
                 n=cfg["scout"]["candidates_per_run"],
-                headlines=json.dumps(headlines, indent=1),
+                headlines=json.dumps(hl, indent=1),
                 past=json.dumps(past, indent=1),
-                queued=json.dumps(queued, indent=1)),
-        }],
-    }
-    reply = None
-    for attempt in (1, 2):  # kimi can be slow on long structured outputs
+                queued=json.dumps(queued, indent=1))}],
+        }
         req = urllib.request.Request(
             f"{base}/chat/completions", data=json.dumps(body).encode(),
             headers={"Authorization": f"Bearer {api_key}",
                      "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=420) as resp:
+            with urllib.request.urlopen(req, timeout=240) as resp:
                 reply = json.loads(resp.read())
-            break
-        except TimeoutError:
-            log.warning("kimi call timed out (attempt %d)", attempt)
-            if attempt == 2:
-                raise
-
-    choice = reply["choices"][0]
-    content = choice["message"].get("content") or ""
-    if not content.strip():
-        raise RuntimeError(
-            f"model returned empty content (finish_reason="
-            f"{choice.get('finish_reason')!r}) — raise max_tokens?")
-    content = re.sub(r"^```(json)?|```$", "", content.strip(), flags=re.M)
-    cands = json.loads(content)["candidates"]
-
-    cleaned = []
-    for c in cands:
-        slug = re.sub(r"[^a-z0-9-]", "", str(c.get("slug", "")).lower())
-        if slug and c.get("title") and c.get("queue_line"):
-            c["slug"] = slug
-            cleaned.append(c)
-    if not cleaned:
-        raise RuntimeError(f"model returned no usable candidates: {content[:200]}")
-    return cleaned
+        except Exception as exc:  # timeouts, 5xx, connection resets
+            last_error = f"attempt {attempt}: {exc}"
+            log.warning("kimi call failed (%s)", last_error)
+            time.sleep(5 * attempt)
+            continue
+        choice = reply["choices"][0]
+        content = choice["message"].get("content") or ""
+        if choice.get("finish_reason") == "length":
+            log.warning("attempt %d: output truncated (finish_reason=length)", attempt)
+        cands = _extract_candidates(content)
+        cleaned = []
+        for c in cands:
+            slug = re.sub(r"[^a-z0-9-]", "", str(c.get("slug", "")).lower())
+            if slug and c.get("title") and c.get("queue_line"):
+                c["slug"] = slug
+                c.setdefault("angle", "")
+                c.setdefault("why_now", "")
+                cleaned.append(c)
+        if cleaned:
+            return cleaned
+        last_error = (f"attempt {attempt}: no usable candidates "
+                      f"(finish={choice.get('finish_reason')!r}, {len(content)} chars)")
+        log.warning(last_error)
+    raise RuntimeError(f"scout model failed after 3 attempts — {last_error}")
 
 
 # ------------------------------------------------------------------- queue --
@@ -356,10 +382,18 @@ def auto_approve_due(cfg: dict, now: datetime) -> None:
         return
     with QUEUE_LOCK:
         queue = load_queue(cfg)
-        due = [c["slug"] for c in queue["candidates"]
-               if c["status"] == "proposed"
-               and datetime.fromisoformat(c["proposed_at"]) +
-               timedelta(hours=hours) < now]
+        due = []
+        for c in queue["candidates"]:
+            if c["status"] != "proposed":
+                continue
+            try:
+                ts = datetime.fromisoformat(c["proposed_at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ts.tzinfo is None:  # tolerate naive timestamps
+                ts = ts.replace(tzinfo=now.tzinfo)
+            if ts + timedelta(hours=hours) < now:
+                due.append(c["slug"])
     for slug in due:
         try:
             approve(cfg, slug, decided_by="auto")

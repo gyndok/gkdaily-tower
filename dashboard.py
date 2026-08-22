@@ -159,7 +159,7 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
         return _spawn(name, arg,
                       ["/opt/homebrew/bin/python3",
                        str(Path(__file__).resolve().parent / "scout.py"),
-                       "--run"], 300)
+                       "--run"], 1200)  # 3 model attempts + feeds + gdoc
     if name == "run_factory_staged":
         # Full research+write on Claude Opus 5, but the script lands in
         # staging/ — nothing reaches the pipeline. For testing/previewing.
@@ -257,17 +257,18 @@ def _spawn(name, arg, argv, timeout) -> str:
         c.commit()
         c.close()
         log.info("action %s finished: %s", name, status)
-        if name == "produce_topic" and status != "done":
-            # The button must never fail silently — surface the root cause
+        if name in ("produce_topic", "run_scout") and status != "done":
+            # Buttons must never fail silently — surface the root cause
             # (last traceback line carries it, e.g. the credit-balance error).
             try:
                 import tower
                 root = (output.strip().splitlines() or ["no output"])[-1][:300]
+                what = ("on-demand production" if name == "produce_topic"
+                        else "Topic Scout run")
                 tower.telegram(CFG,
-                    f"❌ GK Daily: on-demand production FAILED\n"
-                    f"Topic: {arg}\n{root}\n\n"
-                    "The topic is still in the queue — fix the cause and "
-                    "click Produce now again.")
+                    f"❌ GK Daily: {what} FAILED\n"
+                    + (f"Topic: {arg}\n" if arg else "")
+                    + f"{root}\n\nDetails in the dashboard's Recent actions.")
             except Exception:
                 log.warning("failure alert could not be sent", exc_info=True)
 

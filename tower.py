@@ -566,6 +566,17 @@ def main() -> int:
     import dashboard
     dashboard.init(cfg, DB_PATH, get_status,
                    lambda name, meta: expected_title(name, meta))
+    # A restart orphans any action thread that was mid-subprocess; its row
+    # would sit at 'running' forever and block single-flight checks.
+    conn = db()
+    n = conn.execute(
+        "UPDATE actions SET status='interrupted', "
+        "output=COALESCE(output,'') || ' [tower restarted mid-run]' "
+        "WHERE status='running'").rowcount
+    conn.commit()
+    conn.close()
+    if n:
+        log.warning("marked %d orphaned running action(s) as interrupted", n)
     threading.Thread(target=scheduler, args=(cfg,), daemon=True).start()
     server = ThreadingHTTPServer((cfg["bind"], cfg["port"]), dashboard.Handler)
     log.info("serving on %s:%s", cfg["bind"], cfg["port"])
