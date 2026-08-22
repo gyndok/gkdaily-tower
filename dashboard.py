@@ -101,7 +101,6 @@ def _mark_processed(script: Path) -> str:
 
 def dispatch(name: str, arg: str, form: dict | None = None) -> str:
     """Start (or run) one whitelisted action; returns a short ack string."""
-    global _UPCOMING_CACHE
     if name == "add_topic":
         line = " ".join((arg or "").split())[:200]
         if len(line) < 8:
@@ -115,7 +114,7 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
                 return _record(name, arg, "failed",
                                f"position must be a number, got {pos_raw!r}")
             try:
-                upcoming, _ = upcoming_topics()
+                upcoming, _ = upcoming_topics(fresh=True)
             except Exception as exc:
                 return _record(name, arg, "failed",
                                f"could not read topics doc: {exc}")
@@ -127,7 +126,7 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
             msg = scout.gdoc_insert(CFG, line, before_line=before)
         except Exception as exc:
             return _record(name, arg, "failed", str(exc))
-        _UPCOMING_CACHE = None  # show the new line on the next page load
+        _mark_upcoming_stale()  # show the new line on the next page load
         return _record(name, arg, "done", msg)
     pods, clawd = CFG["podcasts_root"], Path.home() / "clawd"
     uploader = ["/opt/homebrew/bin/python3", str(pods / "scripts" / "upload_spotify.py")]
@@ -172,7 +171,7 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
         # Full pipeline kickoff: Factory writes the script for this exact
         # queue line → Drive → the WatchPaths producer renders and uploads.
         try:
-            upcoming, _ = upcoming_topics()
+            upcoming, _ = upcoming_topics(fresh=True)
         except Exception as exc:
             return _record(name, arg, "failed", f"could not read topics doc: {exc}")
         if arg not in upcoming:
@@ -188,7 +187,7 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
         if busy:
             return _record(name, arg, "failed",
                            "a script generation is already running — wait for it")
-        _UPCOMING_CACHE = None  # the line is about to become covered
+        _mark_upcoming_stale()  # the line is about to become covered
         return _spawn(name, arg,
                       [str(Path(CFG["factory"]["python"]).expanduser()),
                        str(Path(__file__).resolve().parent / "factory.py"),
@@ -216,7 +215,7 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
                 results.append(f"{slug}: {fn(CFG, slug)}")
             except Exception as exc:
                 results.append(f"{slug}: FAILED — {exc}")
-        _UPCOMING_CACHE = None
+        _mark_upcoming_stale()
         ok = not any("FAILED" in r for r in results)
         return _record(name, f"{verdict} ×{len(slugs)}",
                        "done" if ok else "failed", "\n".join(results))
@@ -357,24 +356,68 @@ def screenshots(limit: int = 6) -> list[Path]:
     return sorted(pics, key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
 
 
-_UPCOMING_CACHE: tuple[float, list, int] | None = None
+_UPCOMING_CACHE: tuple[float, list, int] | None = None  # (fetched_at, lines, done)
+_UPCOMING_LOCK = threading.Lock()
+_UPCOMING_REFRESHING = False
+_UPCOMING_ERROR: str | None = None
+_UPCOMING_TTL = 300
 
 
-def upcoming_topics() -> tuple[list[str], int]:
-    """Uncovered gdoc queue lines in priority order (top = next up), plus a
-    count of covered lines still sitting in the doc. Cached 5 min — the gdoc
-    read is a gws subprocess and shouldn't run on every page load."""
+def _refresh_upcoming() -> None:
+    """Read the topics gdoc (a gws subprocess that can stall on a bad
+    network) and rebuild the cache. Runs in a background thread for page
+    loads; actions call it directly when they need fresh data."""
+    global _UPCOMING_CACHE, _UPCOMING_REFRESHING, _UPCOMING_ERROR
+    try:
+        import factory
+        import scout
+        lines = scout.gdoc_lines(CFG)
+        covered = factory.covered_topics(CFG)
+        upcoming = [l for l in lines if not factory.is_covered(l, covered)]
+        with _UPCOMING_LOCK:
+            _UPCOMING_CACHE = (time.time(), upcoming, len(lines) - len(upcoming))
+            _UPCOMING_ERROR = None
+    except Exception as exc:
+        log.warning("topics doc refresh failed: %s", exc)
+        with _UPCOMING_LOCK:
+            _UPCOMING_ERROR = str(exc)
+    finally:
+        with _UPCOMING_LOCK:
+            _UPCOMING_REFRESHING = False
+
+
+def _mark_upcoming_stale() -> None:
+    """After an action changes the queue: keep showing the old list, but
+    make the next page load kick off a refresh."""
     global _UPCOMING_CACHE
-    if _UPCOMING_CACHE and time.time() - _UPCOMING_CACHE[0] < 300:
-        return _UPCOMING_CACHE[1], _UPCOMING_CACHE[2]
-    import factory
-    import scout
-    lines = scout.gdoc_lines(CFG)  # raises on gws failure; caller handles
-    covered = factory.covered_topics(CFG)
-    upcoming = [l for l in lines if not factory.is_covered(l, covered)]
-    done_count = len(lines) - len(upcoming)
-    _UPCOMING_CACHE = (time.time(), upcoming, done_count)
-    return upcoming, done_count
+    with _UPCOMING_LOCK:
+        if _UPCOMING_CACHE:
+            _UPCOMING_CACHE = (0.0, _UPCOMING_CACHE[1], _UPCOMING_CACHE[2])
+
+
+def upcoming_topics(fresh: bool = False) -> tuple[list[str], int]:
+    """Uncovered gdoc queue lines in priority order (top = next up), plus a
+    count of covered lines still in the doc.
+
+    NEVER blocks a page load on the network: returns the cached list (even
+    if stale) and refreshes in the background once it is older than the
+    TTL. A stalled Google connection used to hang the whole dashboard past
+    nginx's 60 s limit (2026-08-22). Actions pass fresh=True to wait for a
+    current read before validating against it."""
+    global _UPCOMING_REFRESHING
+    if fresh:
+        _refresh_upcoming()
+    with _UPCOMING_LOCK:
+        cache, err = _UPCOMING_CACHE, _UPCOMING_ERROR
+        stale = cache is None or time.time() - cache[0] > _UPCOMING_TTL
+        if stale and not _UPCOMING_REFRESHING and not fresh:
+            _UPCOMING_REFRESHING = True
+            threading.Thread(target=_refresh_upcoming, daemon=True).start()
+    if cache is None:
+        raise RuntimeError(
+            "topics doc not loaded yet — refreshing in the background, "
+            "reload in a few seconds" + (f" (last error: {err})" if err else ""))
+    return cache[1], cache[2]
 
 
 def topic_candidates() -> dict:
