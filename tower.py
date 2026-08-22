@@ -188,9 +188,14 @@ class Collectors:
         today = f"{self.now:%Y-%m-%d}"
         todays = {name: ts for name, ts in state.items()
                   if ts.startswith(today)}
+        eps = self.cfg["podcasts_root"] / "public" / "episodes"
+        pending = [{"name": p.name,
+                    "age_minutes": round((time.time() - p.stat().st_mtime) / 60)}
+                   for p in eps.glob("*.mp3") if p.name not in state]
         return {
             "total": len(state),
             "today": todays,
+            "pending": pending,
             "briefing_uploaded_at": next(
                 (ts for n, ts in todays.items() if n.startswith("gk_daily_")),
                 None),
@@ -342,6 +347,18 @@ def evaluate(cfg: dict, col: Collectors, data: dict, now: datetime) -> list:
         now if stuck else None,
         detail="; ".join(f"{p['name']} ({p['age_minutes']} min)"
                          for p in stuck) or "clear")
+
+    # 4b. every rendered episode reaches the ledger — the uploader's failure
+    #     is non-fatal to the producer, so a rendered-but-never-uploaded
+    #     episode was invisible here (stablecoin-economy, 2026-08-22 11:09)
+    stuck_up = [] if "error" in led else [
+        p for p in led.get("pending", [])
+        if p["age_minutes"] > cfg.get("upload_stuck_minutes", 30)]
+    add("uploads_pending", "Rendered episodes uploaded to Spotify",
+        None if "error" in led else not stuck_up,
+        now if stuck_up else None,
+        detail="; ".join(f"{p['name']} ({p['age_minutes']} min, not in ledger)"
+                         for p in stuck_up) or "nothing waiting")
 
     # 5. every episode uploaded today is actually live in the Spotify feed
     #    (checked once per episode after verify_window past its upload time)
