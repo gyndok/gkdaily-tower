@@ -3,35 +3,28 @@
   "bind": "127.0.0.1",
   "tick_seconds": 300,
   "timezone": "America/Chicago",
-
   "podcasts_root": "~/podcasts",
   "producer_log": "~/Library/Logs/special-podcast-producer.log",
   "drive_gk_daily": "~/Library/CloudStorage/GoogleDrive-gyndok@gmail.com/My Drive/GK Daily",
   "clawd_env": "~/clawd/.env",
-
   "spotify_rss": "https://anchor.fm/s/115e8a9fc/podcast/rss",
   "rss_cache_seconds": 600,
-
   "deadlines": {
     "briefing_produced": "06:20",
     "briefing_uploaded": "06:35",
     "special_script_arrival": "08:00",
     "digest": "07:00"
   },
-
   "verify_window_minutes": 60,
   "stuck_script_minutes": 45,
   "session_warn_days": 3,
   "disk_min_free_gb": 10,
-
   "launchd_labels": [
     "com.gkdaily.morning",
     "com.geffrey.special-podcast-producer"
   ],
-
   "topic_queue_doc": "https://docs.google.com/document/d/1o3r_j32j_6dnq-M55K74Kbenbotgr7PvXLiuWM3soL8/edit",
   "topic_queue_json": "~/Library/CloudStorage/GoogleDrive-gyndok@gmail.com/My Drive/GK Daily/queue.json",
-
   "factory": {
     "failover_at": "07:30",
     "model": "claude-opus-5",
@@ -40,7 +33,6 @@
     "target_words": 3700,
     "staging_dir": "~/gkdaily-tower/staging"
   },
-
   "scout": {
     "run_at": "21:00",
     "auto_approve_hours": 24,
@@ -55,5 +47,6 @@
       "health": "https://news.google.com/rss/headlines/section/topic/HEALTH?hl=en-US&gl=US&ceid=US:en",
       "business": "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en"
     }
-  }
+  },
+  "media_retention_days": 14
 }

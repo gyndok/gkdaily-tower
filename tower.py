@@ -483,6 +483,67 @@ def maybe_digest(cfg: dict, conn: sqlite3.Connection, rules: list,
     log.info("digest sent for %s", today)
 
 
+# ----------------------------------------------------------------- janitor --
+
+def media_cleanup(cfg: dict, now: datetime) -> str:
+    """Prune local audio that Spotify already hosts.
+
+    Every special exists twice locally (special-editions/ master + the
+    public/episodes copy) even after upload. Keep media_retention_days of
+    audio; delete older mp3s ONLY if they are in the upload ledger with a
+    timestamp older than 3 days (i.e. verified long-since uploaded).
+    Scripts and metadata are never touched. Daily-briefing retention is
+    publish_feed()'s job (episode_max_count).
+    """
+    days = cfg.get("media_retention_days", 14)
+    led_path = cfg["podcasts_root"] / "config" / "spotify_uploaded.json"
+    try:
+        ledger = json.loads(led_path.read_text())
+    except Exception as exc:
+        return f"skipped: ledger unreadable ({exc})"
+    cutoff = (now - timedelta(days=days)).isoformat()
+    safety = (now - timedelta(days=3)).isoformat()
+    freed, n = 0, 0
+
+    eps = cfg["podcasts_root"] / "public" / "episodes"
+    for mp3 in eps.glob("special-edition-*.mp3"):
+        ts = ledger.get(mp3.name)
+        if not ts or ts > cutoff or ts > safety:
+            continue
+        slug = re.sub(r"-\d{4}-\d{2}-\d{2}$", "",
+                      mp3.stem[len("special-edition-"):])
+        master = (cfg["podcasts_root"] / "special-editions" / slug
+                  / "episode.mp3")
+        for f in (mp3, master):
+            if f.exists():
+                freed += f.stat().st_size
+                f.unlink()
+                n += 1
+
+    cache = cfg["podcasts_root"] / "cache"
+    dailies = sorted(cache.glob("*_audio.mp3"),
+                     key=lambda f: f.stat().st_mtime, reverse=True)
+    for f in dailies[2:]:  # match publish's episode_max_count
+        freed += f.stat().st_size
+        f.unlink()
+        n += 1
+    return f"removed {n} file(s), freed {freed / 1e6:.0f} MB"
+
+
+def maybe_media_cleanup(cfg: dict, conn, now: datetime) -> None:
+    today = f"{now:%Y-%m-%d}"
+    conn.execute("CREATE TABLE IF NOT EXISTS media_cleanup "
+                 "(date TEXT PRIMARY KEY, ts TEXT, result TEXT)")
+    if conn.execute("SELECT 1 FROM media_cleanup WHERE date=?",
+                    (today,)).fetchone():
+        return
+    result = media_cleanup(cfg, now)
+    conn.execute("INSERT INTO media_cleanup VALUES (?,?,?)",
+                 (today, now.isoformat(timespec="seconds"), result))
+    conn.commit()
+    log.info("media cleanup: %s", result)
+
+
 # --------------------------------------------------------------- main loop --
 
 LATEST: dict = {}          # last tick's full status, served by HTTP
@@ -504,6 +565,12 @@ def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
             scout.auto_approve_due(cfg, now)
         except Exception:
             log.exception("scout step failed")
+
+    if not quiet:  # local-media janitor: prune audio Spotify already hosts
+        try:
+            maybe_media_cleanup(cfg, conn, now)
+        except Exception:
+            log.exception("media cleanup failed")
 
     if not quiet:  # script factory: failover if no special-edition script
         try:
