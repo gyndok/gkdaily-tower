@@ -616,8 +616,6 @@ def render_page() -> str:
 <p><b>Pending Spotify uploads</b></p><ul>{pend_up_html}</ul>
 <p>{button("Retry Spotify upload", "retry_upload", "",
            "Run the Spotify uploader for all pending episodes now?")}
-{button("Retry Substack upload", "retry_substack", "",
-           "Run the Substack uploader for all pending specials now?")}
 {button("Producer dry-run", "producer_dry_run")}
 {button("Rotate logs", "rotate_logs")}
 {button("Script Factory test (staged)", "run_factory_staged", "",

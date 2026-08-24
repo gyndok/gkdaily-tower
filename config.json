@@ -50,13 +50,8 @@
   },
   "media_retention_days": 14,
   "substack": {
-    "enabled": true,
-    "mode": "upload",
-    "feed_url": "https://geffreyklein.substack.com/feed",
-    "feed_cache_seconds": 900,
-    "sync_grace_min": 120,
-    "delay_min": 10,
-    "retry_min": 30,
-    "backoff_min": 120
+    "enabled": false,
+    "mode": "off",
+    "_note": "Abandoned 2026-08-24 per Geffrey: Substack throttles automated publishing ('Draft not saved'). Spotify is the only distribution path. Flip enabled/mode to revive."
   }
 }
