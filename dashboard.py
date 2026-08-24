@@ -135,6 +135,10 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
 
     if name == "retry_upload":
         return _spawn(name, arg, uploader, 1800)
+    if name == "retry_substack":
+        return _spawn(name, arg,
+                      ["/opt/homebrew/bin/python3",
+                       str(pods / "scripts" / "upload_substack.py")], 1800)
     if name == "producer_dry_run":
         return _spawn(name, arg, producer + ["--dry-run"], 600)
     if name == "force_produce":
@@ -612,6 +616,8 @@ def render_page() -> str:
 <p><b>Pending Spotify uploads</b></p><ul>{pend_up_html}</ul>
 <p>{button("Retry Spotify upload", "retry_upload", "",
            "Run the Spotify uploader for all pending episodes now?")}
+{button("Retry Substack upload", "retry_substack", "",
+           "Run the Substack uploader for all pending specials now?")}
 {button("Producer dry-run", "producer_dry_run")}
 {button("Rotate logs", "rotate_logs")}
 {button("Script Factory test (staged)", "run_factory_staged", "",

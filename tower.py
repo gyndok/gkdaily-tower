@@ -140,6 +140,7 @@ class Collectors:
             "launchd": self._guard(self.launchd),
             "drive": self._guard(self.drive),
             "session": self._guard(self.session),
+            "substack": self._guard(self.substack),
             "disk": self._guard(self.disk),
             "log_errors": self._guard(self.log_errors),
         }
@@ -212,6 +213,31 @@ class Collectors:
                 loaded[parts[2]] = parts[1]  # label -> last exit status
         return {label: loaded.get(label)  # None = not loaded
                 for label in self.cfg["launchd_labels"]}
+
+    # -- substack (specials only; dailies never go there) --------------------
+    def substack(self) -> dict:
+        cfg_s = self.cfg.get("substack", {})
+        sub_path = self.cfg["podcasts_root"] / "config" / "substack_uploaded.json"
+        spot_path = self.cfg["podcasts_root"] / "config" / "spotify_uploaded.json"
+        sub = json.loads(sub_path.read_text()) if sub_path.exists() else {}
+        spot = json.loads(spot_path.read_text()) if spot_path.exists() else {}
+        pending = []
+        for name, ts in spot.items():
+            if not name.startswith("special-edition-") or name in sub:
+                continue
+            try:
+                age = (self.now - datetime.fromisoformat(ts)
+                       .replace(tzinfo=self.now.tzinfo)).total_seconds() / 60
+            except ValueError:
+                age = 0
+            pending.append({"name": name, "age_minutes": round(age)})
+        sess = self.cfg["podcasts_root"] / ".substack-session.json"
+        return {
+            "enabled": bool(cfg_s.get("enabled")),
+            "pending": sorted(pending, key=lambda x: -x["age_minutes"]),
+            "session_exists": sess.exists(),
+            "uploaded_total": len(sub),
+        }
 
     # -- google drive --------------------------------------------------------
     def drive(self) -> dict:
@@ -376,6 +402,23 @@ def evaluate(cfg: dict, col: Collectors, data: dict, now: datetime) -> list:
             add(f"live:{name}", f"Live on Spotify: {name}",
                 ok, due, detail=f"expect title “{want}”")
 
+    # 5b. specials reach Substack too (upload_substack.py, specials only)
+    sub = data.get("substack", {})
+    if sub.get("enabled") and "error" not in sub:
+        cfg_s = cfg.get("substack", {})
+        stuck = [p for p in sub["pending"]
+                 if p["age_minutes"] > cfg_s.get("stuck_min", 90)]
+        add("substack_pending", "Specials published to Substack",
+            not stuck, now if stuck else None,
+            detail="; ".join(f"{p['name']} ({p['age_minutes']} min)"
+                             for p in stuck) or
+            (f"{len(sub['pending'])} in flight" if sub["pending"]
+             else "nothing waiting"))
+        add("substack_session", "Substack login session present",
+            sub["session_exists"], now, severity="yellow",
+            detail="ready" if sub["session_exists"] else
+            "no session — run: cd ~/podcasts && python3 scripts/upload_substack.py --login")
+
     # 6. launchd jobs loaded
     ld = data["launchd"]
     missing = [] if "error" in ld else [k for k, v in ld.items() if v is None]
@@ -503,6 +546,13 @@ def media_cleanup(cfg: dict, now: datetime) -> str:
         return f"skipped: ledger unreadable ({exc})"
     cutoff = (now - timedelta(days=days)).isoformat()
     safety = (now - timedelta(days=3)).isoformat()
+    substack = {}
+    if cfg.get("substack", {}).get("enabled"):
+        sub_path = cfg["podcasts_root"] / "config" / "substack_uploaded.json"
+        try:
+            substack = json.loads(sub_path.read_text()) if sub_path.exists() else {}
+        except Exception:
+            return "skipped: substack ledger unreadable"
     freed, n = 0, 0
 
     eps = cfg["podcasts_root"] / "public" / "episodes"
@@ -510,6 +560,8 @@ def media_cleanup(cfg: dict, now: datetime) -> str:
         ts = ledger.get(mp3.name)
         if not ts or ts > cutoff or ts > safety:
             continue
+        if cfg.get("substack", {}).get("enabled") and mp3.name not in substack:
+            continue  # Substack still needs the local file
         slug = re.sub(r"-\d{4}-\d{2}-\d{2}$", "",
                       mp3.stem[len("special-edition-"):])
         master = (cfg["podcasts_root"] / "special-editions" / slug
@@ -544,6 +596,52 @@ def maybe_media_cleanup(cfg: dict, conn, now: datetime) -> None:
     log.info("media cleanup: %s", result)
 
 
+# ---------------------------------------------------------- substack runner --
+
+def maybe_substack_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
+    """Push new specials to Substack automatically: wait delay_min after the
+    Spotify upload (so metadata is settled), then run the uploader; retry
+    every retry_min while anything is pending. The stuck rule goes red at
+    stuck_min. Needs the one-time --login session."""
+    sub = data.get("substack", {})
+    cfg_s = cfg.get("substack", {})
+    if not sub.get("enabled") or "error" in sub or not sub.get("session_exists"):
+        return
+    due = [p for p in sub["pending"]
+           if p["age_minutes"] >= cfg_s.get("delay_min", 10)]
+    if not due:
+        return
+    conn.execute("CREATE TABLE IF NOT EXISTS substack_runs "
+                 "(ts TEXT, result TEXT)")
+    last = conn.execute("SELECT MAX(ts) FROM substack_runs").fetchone()[0]
+    if last:
+        mins = (now - datetime.fromisoformat(last)).total_seconds() / 60
+        if mins < cfg_s.get("retry_min", 30):
+            return
+    conn.execute("INSERT INTO substack_runs VALUES (?,?)",
+                 (now.isoformat(timespec="seconds"), "running"))
+    conn.commit()
+    ts_key = now.isoformat(timespec="seconds")
+
+    def go():
+        try:
+            proc = subprocess.run(
+                ["/opt/homebrew/bin/python3",
+                 str(cfg["podcasts_root"] / "scripts" / "upload_substack.py")],
+                capture_output=True, text=True, timeout=1800)
+            result = "ok" if proc.returncode == 0 else                 f"rc={proc.returncode}: {(proc.stderr or proc.stdout).strip()[-300:]}"
+        except Exception as exc:
+            result = f"failed: {exc}"
+        c = sqlite3.connect(DB_PATH)
+        c.execute("UPDATE substack_runs SET result=? WHERE ts=?", (result, ts_key))
+        c.commit()
+        c.close()
+        log.info("substack auto-upload: %s", result)
+
+    threading.Thread(target=go, daemon=True).start()
+    log.info("substack auto-upload started for %d pending special(s)", len(due))
+
+
 # --------------------------------------------------------------- main loop --
 
 LATEST: dict = {}          # last tick's full status, served by HTTP
@@ -571,6 +669,12 @@ def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
             maybe_media_cleanup(cfg, conn, now)
         except Exception:
             log.exception("media cleanup failed")
+
+    if not quiet:  # substack: push new specials once Spotify has them
+        try:
+            maybe_substack_upload(cfg, conn, now, data)
+        except Exception:
+            log.exception("substack step failed")
 
     if not quiet:  # script factory: failover if no special-edition script
         try:

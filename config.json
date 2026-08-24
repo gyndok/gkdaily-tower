@@ -48,5 +48,11 @@
       "business": "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en"
     }
   },
-  "media_retention_days": 14
+  "media_retention_days": 14,
+  "substack": {
+    "enabled": true,
+    "delay_min": 10,
+    "retry_min": 30,
+    "stuck_min": 90
+  }
 }
