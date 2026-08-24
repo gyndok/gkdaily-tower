@@ -56,6 +56,7 @@
     "feed_cache_seconds": 900,
     "sync_grace_min": 120,
     "delay_min": 10,
-    "retry_min": 30
+    "retry_min": 30,
+    "backoff_min": 120
   }
 }

@@ -675,10 +675,16 @@ def maybe_substack_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
         return
     conn.execute("CREATE TABLE IF NOT EXISTS substack_runs "
                  "(ts TEXT, result TEXT)")
-    last = conn.execute("SELECT MAX(ts) FROM substack_runs").fetchone()[0]
-    if last:
-        mins = (now - datetime.fromisoformat(last)).total_seconds() / 60
-        if mins < cfg_s.get("retry_min", 30):
+    row = conn.execute("SELECT ts, result FROM substack_runs "
+                       "ORDER BY ts DESC LIMIT 1").fetchone()
+    if row:
+        mins = (now - datetime.fromisoformat(row[0])).total_seconds() / 60
+        # A 429 means Substack is throttling this machine; retrying on the
+        # normal cadence just extends the block.
+        wait = (cfg_s.get("backoff_min", 120)
+                if row[1] and ("rc=3" in row[1] or "rate limit" in row[1].lower())
+                else cfg_s.get("retry_min", 30))
+        if mins < wait:
             return
     conn.execute("INSERT INTO substack_runs VALUES (?,?)",
                  (now.isoformat(timespec="seconds"), "running"))
