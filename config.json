@@ -51,8 +51,11 @@
   "media_retention_days": 14,
   "substack": {
     "enabled": true,
+    "mode": "upload",
+    "feed_url": "https://geffreyklein.substack.com/feed",
+    "feed_cache_seconds": 900,
+    "sync_grace_min": 120,
     "delay_min": 10,
-    "retry_min": 30,
-    "stuck_min": 90
+    "retry_min": 30
   }
 }

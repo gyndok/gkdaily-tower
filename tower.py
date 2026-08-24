@@ -216,28 +216,83 @@ class Collectors:
 
     # -- substack (specials only; dailies never go there) --------------------
     def substack(self) -> dict:
+        """Compare specials on Spotify against the public Substack feed.
+
+        Substack imports this show from the Spotify RSS feed, so episodes
+        normally arrive on their own; this verifies they did rather than
+        assuming it. Only episodes inside the feed's visible window (it
+        returns ~20 posts) can be judged, so older ones are ignored.
+        """
         cfg_s = self.cfg.get("substack", {})
-        sub_path = self.cfg["podcasts_root"] / "config" / "substack_uploaded.json"
+        if not cfg_s.get("enabled"):
+            return {"enabled": False}
         spot_path = self.cfg["podcasts_root"] / "config" / "spotify_uploaded.json"
-        sub = json.loads(sub_path.read_text()) if sub_path.exists() else {}
         spot = json.loads(spot_path.read_text()) if spot_path.exists() else {}
-        pending = []
+        meta_path = (self.cfg["podcasts_root"] / "public" / "episodes"
+                     / "special_editions.json")
+        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+
+        titles, oldest = self.substack_feed()
+        if titles is None:
+            return {"enabled": True, "error": "substack feed unreachable"}
+        norm = lambda x: re.sub(r"[^a-z0-9]", "", x.lower())
+        feed_norm = [norm(t) for t in titles]
+
+        missing, waiting = [], []
+        grace = cfg_s.get("sync_grace_min", 120)
         for name, ts in spot.items():
-            if not name.startswith("special-edition-") or name in sub:
+            if not name.startswith("special-edition-"):
                 continue
             try:
-                age = (self.now - datetime.fromisoformat(ts)
-                       .replace(tzinfo=self.now.tzinfo)).total_seconds() / 60
+                up = datetime.fromisoformat(ts).replace(tzinfo=self.now.tzinfo)
             except ValueError:
-                age = 0
-            pending.append({"name": name, "age_minutes": round(age)})
-        sess = self.cfg["podcasts_root"] / ".substack-session.json"
-        return {
-            "enabled": bool(cfg_s.get("enabled")),
-            "pending": sorted(pending, key=lambda x: -x["age_minutes"]),
-            "session_exists": sess.exists(),
-            "uploaded_total": len(sub),
-        }
+                continue
+            if oldest and up < oldest:
+                continue  # outside the feed's visible window — can't judge
+            age = (self.now - up).total_seconds() / 60
+            title = meta.get(name, {}).get("title", "")
+            # Substack sometimes shortens the title (full subtitle dropped),
+            # so match on a short prefix and also on the episode slug.
+            slug = re.sub(r"-\d{4}-\d{2}-\d{2}$", "",
+                          name[len("special-edition-"):-4]).replace("-", "")
+            keys = [k for k in (norm(title)[:28], norm(slug)) if len(k) > 8]
+            if any(k in f or f[:28] in norm(title) for k in keys
+                   for f in feed_norm if f):
+                continue
+            (missing if age > grace else waiting).append(
+                {"name": name, "title": title[:70], "age_minutes": round(age)})
+        return {"enabled": True, "missing": missing, "waiting": waiting,
+                "feed_posts": len(titles),
+                "session_exists": (self.cfg["podcasts_root"]
+                                   / ".substack-session.json").exists()}
+
+    def substack_feed(self):
+        """(titles, oldest_pubdate) from the public Substack feed; cached."""
+        if getattr(self, "_sub_cache", None) and (
+                time.time() - self._sub_cache[0] < self.cfg.get(
+                    "substack", {}).get("feed_cache_seconds", 900)):
+            return self._sub_cache[1], self._sub_cache[2]
+        url = self.cfg.get("substack", {}).get(
+            "feed_url", "https://geffreyklein.substack.com/feed")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                root = ET.fromstring(resp.read())
+            items = root.findall(".//item")
+            titles = [(i.findtext("title") or "").strip() for i in items]
+            oldest = None
+            if items:
+                from email.utils import parsedate_to_datetime
+                try:
+                    oldest = parsedate_to_datetime(
+                        items[-1].findtext("pubDate")).astimezone(self.now.tzinfo)
+                except Exception:
+                    oldest = None
+            self._sub_cache = (time.time(), titles, oldest)
+            return titles, oldest
+        except Exception as exc:
+            log.warning("substack feed fetch failed: %s", exc)
+            return None, None
 
     # -- google drive --------------------------------------------------------
     def drive(self) -> dict:
@@ -402,22 +457,20 @@ def evaluate(cfg: dict, col: Collectors, data: dict, now: datetime) -> list:
             add(f"live:{name}", f"Live on Spotify: {name}",
                 ok, due, detail=f"expect title “{want}”")
 
-    # 5b. specials reach Substack too (upload_substack.py, specials only)
+    # 5b. specials reach Substack (normally via its Spotify-RSS import)
     sub = data.get("substack", {})
-    if sub.get("enabled") and "error" not in sub:
-        cfg_s = cfg.get("substack", {})
-        stuck = [p for p in sub["pending"]
-                 if p["age_minutes"] > cfg_s.get("stuck_min", 90)]
-        add("substack_pending", "Specials published to Substack",
-            not stuck, now if stuck else None,
-            detail="; ".join(f"{p['name']} ({p['age_minutes']} min)"
-                             for p in stuck) or
-            (f"{len(sub['pending'])} in flight" if sub["pending"]
-             else "nothing waiting"))
-        add("substack_session", "Substack login session present",
-            sub["session_exists"], now, severity="yellow",
-            detail="ready" if sub["session_exists"] else
-            "no session — run: cd ~/podcasts && python3 scripts/upload_substack.py --login")
+    if sub.get("enabled"):
+        if "error" in sub:
+            add("substack_synced", "Specials synced to Substack", None, None,
+                severity="yellow", detail=sub["error"])
+        else:
+            miss = sub.get("missing", [])
+            add("substack_synced", "Specials synced to Substack",
+                not miss, now if miss else None,
+                detail="; ".join(f"{m['title'] or m['name']} ({m['age_minutes']} min)"
+                                 for m in miss)
+                or (f"{len(sub.get('waiting', []))} still importing"
+                    if sub.get("waiting") else "all recent specials present"))
 
     # 6. launchd jobs loaded
     ld = data["launchd"]
@@ -513,6 +566,13 @@ def maybe_digest(cfg: dict, conn: sqlite3.Connection, rules: list,
         specials = [n for n in led_today if n.startswith("special-edition-")]
         lines.append(f"  • specials uploaded today: "
                      f"{', '.join(specials) if specials else 'none yet'}")
+        sub_d = data.get("substack", {})
+        if sub_d.get("enabled") and "error" not in sub_d:
+            miss = sub_d.get("missing", [])
+            lines.append("  • Substack: "
+                         + (f"{len(miss)} special(s) missing — "
+                            + ", ".join(m["name"] for m in miss[:2])
+                            if miss else "specials in sync"))
         pend = data["special"].get("pending", [])
         if pend:
             lines.append(f"  • awaiting production: "
@@ -605,9 +665,11 @@ def maybe_substack_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
     stuck_min. Needs the one-time --login session."""
     sub = data.get("substack", {})
     cfg_s = cfg.get("substack", {})
-    if not sub.get("enabled") or "error" in sub or not sub.get("session_exists"):
+    if (not sub.get("enabled") or "error" in sub
+            or cfg_s.get("mode") != "upload"      # default is verify-only
+            or not sub.get("session_exists")):
         return
-    due = [p for p in sub["pending"]
+    due = [p for p in sub.get("missing", []) + sub.get("waiting", [])
            if p["age_minutes"] >= cfg_s.get("delay_min", 10)]
     if not due:
         return
