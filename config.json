@@ -53,5 +53,10 @@
     "enabled": false,
     "mode": "off",
     "_note": "Abandoned 2026-08-24 per Geffrey: Substack throttles automated publishing ('Draft not saved'). Spotify is the only distribution path. Flip enabled/mode to revive."
+  },
+  "producer_nudge": {
+    "enabled": true,
+    "after_min": 8,
+    "retry_min": 20
   }
 }

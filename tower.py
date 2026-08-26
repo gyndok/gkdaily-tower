@@ -656,6 +656,69 @@ def maybe_media_cleanup(cfg: dict, conn, now: datetime) -> None:
     log.info("media cleanup: %s", result)
 
 
+# ------------------------------------------------------------ producer nudge --
+
+def maybe_nudge_producer(cfg: dict, conn, now: datetime, data: dict) -> None:
+    """Run the producer for a script it never picked up.
+
+    The producer fires on a launchd WatchPaths trigger with a 300 s throttle,
+    so a script landing just after a run (or during the window) can sit
+    untouched until the next trigger — which may be the next weekday. Seen
+    2026-08-26: the Mars script arrived the same minute the previous episode
+    finished and waited for a manual run.
+    """
+    cfg_n = cfg.get("producer_nudge", {})
+    if not cfg_n.get("enabled", True):
+        return
+    sp = data.get("special", {})
+    if "error" in sp:
+        return
+    stale = [p for p in sp.get("pending", [])
+             if p["age_minutes"] >= cfg_n.get("after_min", 8)]
+    if not stale:
+        return
+    # Never start a second producer on top of a running one.
+    try:
+        running = subprocess.run(["pgrep", "-f", "produce-special-podcast.py"],
+                                 capture_output=True, text=True, timeout=10)
+        if running.returncode == 0 and running.stdout.strip():
+            return
+    except Exception:
+        return
+    conn.execute("CREATE TABLE IF NOT EXISTS producer_nudges (ts TEXT, result TEXT)")
+    last = conn.execute("SELECT MAX(ts) FROM producer_nudges").fetchone()[0]
+    if last:
+        mins = (now - datetime.fromisoformat(last)).total_seconds() / 60
+        if mins < cfg_n.get("retry_min", 20):
+            return
+    ts_key = now.isoformat(timespec="seconds")
+    conn.execute("INSERT INTO producer_nudges VALUES (?,?)", (ts_key, "running"))
+    conn.commit()
+    names = ", ".join(p["name"] for p in stale)
+    log.info("nudging producer for unprocessed script(s): %s", names)
+
+    def go():
+        clawd = Path.home() / "clawd"
+        try:
+            proc = subprocess.run(
+                [str(clawd / ".venv" / "bin" / "python3"),
+                 str(clawd / "produce-special-podcast.py")],
+                capture_output=True, text=True, timeout=2400)
+            result = ("ok" if proc.returncode == 0
+                      else f"rc={proc.returncode}: {(proc.stderr or '').strip()[-200:]}")
+        except Exception as exc:
+            result = f"failed: {exc}"
+        c = sqlite3.connect(DB_PATH)
+        c.execute("UPDATE producer_nudges SET result=? WHERE ts=?", (result, ts_key))
+        c.commit(); c.close()
+        log.info("producer nudge: %s", result)
+        if not result.startswith("ok"):
+            telegram(cfg, f"⚠️ GK Daily: auto-run of the producer for {names} "
+                          f"failed — {result[:200]}")
+
+    threading.Thread(target=go, daemon=True).start()
+
+
 # ---------------------------------------------------------- substack runner --
 
 def maybe_substack_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
@@ -737,6 +800,12 @@ def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
             maybe_media_cleanup(cfg, conn, now)
         except Exception:
             log.exception("media cleanup failed")
+
+    if not quiet:  # producer: run scripts the WatchPaths trigger missed
+        try:
+            maybe_nudge_producer(cfg, conn, now, data)
+        except Exception:
+            log.exception("producer nudge failed")
 
     if not quiet:  # substack: push new specials once Spotify has them
         try:

@@ -233,6 +233,13 @@ def deliver(cfg: dict, topic: dict, script: str, stage: bool) -> Path:
 
 
 def run(cfg: dict, stage: bool = False, topic_line: str | None = None) -> str:
+    if topic_line is not None and not topic_line.strip():
+        # An empty --topic used to fall through to auto-pick, which silently
+        # produced a DIFFERENT episode than the caller asked for (2026-08-26:
+        # started writing "Drug shortages" when asked for Mars).
+        raise RuntimeError("--topic was empty; refusing to auto-pick a "
+                           "different topic. Pass a real queue line or omit "
+                           "--topic entirely.")
     if topic_line:
         # Explicit topic (dashboard "Produce now" button). Refuse anything
         # already covered so a stale page can't double-produce an episode.
