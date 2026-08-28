@@ -84,3 +84,25 @@ outcome reported to Telegram either way. Config: `upload_retry` in
 `config.json`. This covers episodes made by *any* path, not just the on-demand
 one. Companion to `producer_nudge`, which starts a script the WatchPaths
 trigger missed.
+
+## Model fallback
+
+`factory.generate()` writes on Claude Opus 5 with live web search, and falls
+back to Kimi (`kimi-k2.6`, key from `~/minibot/.env`) on any Claude failure —
+outage, timeout, or spend cap. The daily briefing has had an
+Anthropic → NVIDIA → Kimi chain for months; specials had none, so when the
+shared Anthropic key hit its cap on 2026-08-28 the special-edition path
+stopped dead with no degraded mode.
+
+The fallback is deliberately honest about being degraded: Kimi has no web
+search on this path, so the prompt tells it to write from its own knowledge,
+avoid anything turning on current news, and say in the `--- SOURCES ---` block
+that the episode was written without live research. Telegram gets a warning
+when the fallback engages. `thinking: {"type": "disabled"}` is required — as a
+reasoning model Kimi otherwise spends the token budget thinking and returns
+truncated output. Verified 2026-08-28: 3,724 words, correct title line, pause
+markers intact, voice rules respected.
+
+Note that all three envs (`~/minibot`, `~/podcasts`, `~/clawd`) share ONE
+Anthropic key, so a cap takes out MiniBot's tool loop, the Factory, and the
+briefing's primary tier simultaneously.

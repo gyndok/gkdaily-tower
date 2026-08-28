@@ -31,7 +31,9 @@
     "python": "~/podcasts/venv/bin/python3",
     "podcasts_env": "~/podcasts/.env",
     "target_words": 3700,
-    "staging_dir": "~/gkdaily-tower/staging"
+    "staging_dir": "~/gkdaily-tower/staging",
+    "fallback_model": "kimi-k2.6",
+    "minibot_env": "~/minibot/.env"
   },
   "scout": {
     "run_at": "21:00",

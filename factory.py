@@ -31,6 +31,8 @@ import json
 import logging
 import os
 import re
+import time
+import urllib.request
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -154,7 +156,112 @@ Your FINAL message must contain ONLY the complete file content, starting with \
 the `# Title` line — no commentary before or after."""
 
 
+def _generate_via_kimi(cfg: dict, topic: dict, user_prompt: str) -> str:
+    """Write the script on Kimi when Claude is unavailable.
+
+    Added 2026-08-28, when the shared Anthropic key hit its spend cap and the
+    special-edition path — which had no fallback, unlike the daily briefing —
+    simply stopped producing. Degraded on purpose: Kimi has no web search
+    here, so the script runs on the model's own knowledge and says so in the
+    SOURCES block rather than implying research it did not do. Good enough for
+    an evergreen explainer, weak for anything news-driven.
+
+    Uses scout's proven call shape: thinking disabled (a reasoning model spends
+    the token budget on reasoning and returns truncated output otherwise).
+    """
+    creds = tower.load_env_creds(
+        Path(cfg["factory"].get("minibot_env", "~/minibot/.env")).expanduser())
+    api_key = creds.get("KIMI_API_KEY")
+    if not api_key:
+        raise RuntimeError("KIMI_API_KEY not found; no fallback available")
+    base = creds.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
+    model = cfg["factory"].get("fallback_model", "kimi-k2.6")
+
+    body = {
+        "model": model,
+        "thinking": {"type": "disabled"},
+        "max_tokens": 16000,
+        "messages": [
+            {"role": "system",
+             "content": SYSTEM.replace("{words}", str(cfg["factory"]["target_words"]))},
+            {"role": "user", "content": user_prompt + (
+                "\n\nYou have NO web search on this path. Write from your own "
+                "knowledge, keep every factual claim one you are confident in, "
+                "and avoid anything that turns on this week's news. In the "
+                "--- SOURCES --- block, state plainly that the episode was "
+                "written without live research.")},
+        ],
+    }
+    req = urllib.request.Request(
+        f"{base}/chat/completions", data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"})
+    last = None
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=900) as resp:
+                reply = json.loads(resp.read())
+            choice = reply["choices"][0]
+            if choice.get("finish_reason") == "length":
+                log.warning("kimi output truncated (finish_reason=length)")
+            text = choice["message"].get("content") or ""
+            if text.strip():
+                log.info("script generated via kimi fallback (%s)", model)
+                return text
+            last = "empty content"
+        except Exception as exc:
+            last = str(exc)
+        log.warning("kimi attempt %d failed: %s", attempt, last)
+        time.sleep(5 * attempt)
+    raise RuntimeError(f"kimi fallback failed: {last}")
+
+
+def _finalize(text: str, via: str) -> str:
+    """Shared validation for whichever model wrote the script."""
+    m = re.search(r"^# .+$", text, re.M)
+    if not m:
+        raise RuntimeError(f"no '# Title' line in {via} output: {text[:200]!r}")
+    script = text[m.start():].strip() + "\n"
+
+    body = re.split(r"^---\s*SOURCES\s*---", script, flags=re.M)[0]
+    word_count = len(body.split())
+    if word_count < 2000:
+        raise RuntimeError(f"script too short ({word_count} words, via {via})")
+    if "--- SOURCES ---" not in script:
+        script += "\n--- SOURCES ---\n(sources unavailable)\n"
+    if "[pause]" not in script:
+        log.warning("script has no [pause] markers")
+    log.info("script generated: %d words (via %s)", word_count, via)
+    return script
+
+
 def generate(cfg: dict, topic: dict) -> str:
+    """Write the script on Claude, falling back to Kimi if Claude refuses.
+
+    The daily briefing has had an Anthropic -> NVIDIA -> Kimi chain for
+    months; specials had none, so a spend cap on the shared key stopped them
+    dead. Any Claude failure now degrades instead of aborting.
+    """
+    now = datetime.now(ZoneInfo(cfg["timezone"]))
+    user_prompt = (
+        f"Today is {now:%A, %B %d, %Y}. Research and write today's GK Daily "
+        f"Special Edition script.\n\nTopic (from the {topic['source']}): "
+        f"{topic['line']}\n\nAlready-covered topics (do not drift into these): "
+        f"{', '.join(covered_topics(cfg)[:40])}")
+    try:
+        return _finalize(_generate_via_claude(cfg, user_prompt), "claude")
+    except Exception as exc:
+        log.warning("claude generation failed (%s) — falling back to kimi", exc)
+        try:
+            tower.telegram(cfg, "⚠️ GK Daily: Claude unavailable for the script "
+                                f"({str(exc)[:120]}). Writing it on Kimi instead "
+                                "— no live web research on that path.")
+        except Exception:
+            pass
+        return _finalize(_generate_via_kimi(cfg, topic, user_prompt), "kimi")
+
+
+def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
     import anthropic  # only available in the podcasts venv
 
     creds = tower.load_env_creds(Path(cfg["factory"]["podcasts_env"]).expanduser())
@@ -162,13 +269,6 @@ def generate(cfg: dict, topic: dict) -> str:
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not found")
     client = anthropic.Anthropic(api_key=api_key, timeout=900.0)
-
-    now = datetime.now(ZoneInfo(cfg["timezone"]))
-    user_prompt = (
-        f"Today is {now:%A, %B %d, %Y}. Research and write today's GK Daily "
-        f"Special Edition script.\n\nTopic (from the {topic['source']}): "
-        f"{topic['line']}\n\nAlready-covered topics (do not drift into these): "
-        f"{', '.join(covered_topics(cfg)[:40])}")
 
     tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 10}]
     messages = [{"role": "user", "content": user_prompt}]
@@ -194,22 +294,7 @@ def generate(cfg: dict, topic: dict) -> str:
     else:
         raise RuntimeError("generation did not finish within 8 pause_turn rounds")
 
-    text = "\n".join(b.text for b in response.content if b.type == "text")
-    m = re.search(r"^# .+$", text, re.M)
-    if not m:
-        raise RuntimeError(f"no '# Title' line in model output: {text[:200]!r}")
-    script = text[m.start():].strip() + "\n"
-
-    body = re.split(r"^---\s*SOURCES\s*---", script, flags=re.M)[0]
-    word_count = len(body.split())
-    if word_count < 2000:
-        raise RuntimeError(f"script too short ({word_count} words)")
-    if "--- SOURCES ---" not in script:
-        script += "\n--- SOURCES ---\n(sources unavailable)\n"
-    if "[pause]" not in script:
-        log.warning("script has no [pause] markers")
-    log.info("script generated: %d words", word_count)
-    return script
+    return "\n".join(b.text for b in response.content if b.type == "text")
 
 
 # ----------------------------------------------------------------- deliver --
