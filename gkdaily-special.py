@@ -30,6 +30,7 @@ Progress goes to Telegram at each milestone so a phone shows the same story.
 import argparse
 import fcntl
 import json
+import os
 import re
 import subprocess
 import sys
@@ -93,11 +94,19 @@ def say(msg: str, telegram: bool = True) -> None:
     stamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{stamp}] {msg}"
     print(line, flush=True)
+    # Only write the log file when stdout is NOT already pointed at it — the
+    # dispatch/MiniBot launchers redirect into the same path, which otherwise
+    # records every line twice.
     try:
-        with open(LOG, "a") as f:
-            f.write(line + "\n")
+        same = LOG.exists() and os.fstat(1).st_ino == os.stat(LOG).st_ino
     except Exception:
-        pass
+        same = False
+    if not same:
+        try:
+            with open(LOG, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
     if telegram and not QUIET:
         notify(msg)
 
