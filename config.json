@@ -58,5 +58,10 @@
     "enabled": true,
     "after_min": 8,
     "retry_min": 20
+  },
+  "upload_retry": {
+    "enabled": true,
+    "after_min": 20,
+    "retry_min": 30
   }
 }

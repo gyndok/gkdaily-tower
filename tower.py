@@ -656,6 +656,70 @@ def maybe_media_cleanup(cfg: dict, conn, now: datetime) -> None:
     log.info("media cleanup: %s", result)
 
 
+# ------------------------------------------------------------- upload retry --
+
+def maybe_retry_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
+    """Re-run the Spotify uploader for an episode that rendered but never
+    reached the ledger.
+
+    The producer's upload stage is deliberately non-fatal, so a transient
+    Creators-SPA failure (navigation race 2026-08-22, selector timeout
+    2026-08-24) leaves a finished episode unpublished until someone notices.
+    The uploads_pending rule already sees it; this acts on it.
+    """
+    cfg_u = cfg.get("upload_retry", {})
+    if not cfg_u.get("enabled", True):
+        return
+    led = data.get("ledger", {})
+    if "error" in led:
+        return
+    stuck = [p for p in led.get("pending", [])
+             if p["age_minutes"] >= cfg_u.get("after_min", 20)]
+    if not stuck:
+        return
+    try:  # never stack uploaders — the script also holds its own flock
+        r = subprocess.run(["pgrep", "-f", "upload_spotify.py"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return
+    except Exception:
+        return
+    conn.execute("CREATE TABLE IF NOT EXISTS upload_retries (ts TEXT, result TEXT)")
+    last = conn.execute("SELECT MAX(ts) FROM upload_retries").fetchone()[0]
+    if last:
+        mins = (now - datetime.fromisoformat(last)).total_seconds() / 60
+        if mins < cfg_u.get("retry_min", 30):
+            return
+    ts_key = now.isoformat(timespec="seconds")
+    conn.execute("INSERT INTO upload_retries VALUES (?,?)", (ts_key, "running"))
+    conn.commit()
+    names = ", ".join(p["name"] for p in stuck)
+    log.info("retrying Spotify upload for: %s", names)
+
+    def go():
+        try:
+            proc = subprocess.run(
+                ["/opt/homebrew/bin/python3",
+                 str(cfg["podcasts_root"] / "scripts" / "upload_spotify.py")],
+                capture_output=True, text=True, timeout=1800)
+            result = ("ok" if proc.returncode == 0
+                      else f"rc={proc.returncode}: {(proc.stderr or '').strip()[-200:]}")
+        except Exception as exc:
+            result = f"failed: {exc}"
+        c = sqlite3.connect(DB_PATH)
+        c.execute("UPDATE upload_retries SET result=? WHERE ts=?", (result, ts_key))
+        c.commit(); c.close()
+        log.info("upload retry: %s", result)
+        if result.startswith("ok"):
+            telegram(cfg, f"⬆️ GK Daily: auto-retried the Spotify upload for "
+                          f"{names} — it had rendered but never uploaded.")
+        else:
+            telegram(cfg, f"❌ GK Daily: auto-retry of the Spotify upload for "
+                          f"{names} failed — {result[:180]}")
+
+    threading.Thread(target=go, daemon=True).start()
+
+
 # ------------------------------------------------------------ producer nudge --
 
 def maybe_nudge_producer(cfg: dict, conn, now: datetime, data: dict) -> None:
@@ -800,6 +864,12 @@ def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
             maybe_media_cleanup(cfg, conn, now)
         except Exception:
             log.exception("media cleanup failed")
+
+    if not quiet:  # spotify: re-upload episodes that rendered but never landed
+        try:
+            maybe_retry_upload(cfg, conn, now, data)
+        except Exception:
+            log.exception("upload retry failed")
 
     if not quiet:  # producer: run scripts the WatchPaths trigger missed
         try:
