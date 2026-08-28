@@ -66,10 +66,13 @@ producer derives its own slug and date from the script filename.
 2. **`~/clawd/dispatch.sh`** — see `docs/dispatch-route.sh`.
 3. **Direct / ssh.**
 
-Note the two-bot split: MiniBot answers from its own bot token, while the
-tower and `gkdaily-special.py` send progress via the `~/clawd/.env` bot. Both
-DM the same chat id, so the pipeline's stage updates arrive in a *different*
-bot thread than the one the request was typed into.
+Progress goes through **MiniBot's own bot** (`@Gyndok_notes_bot`, credentials
+from `~/minibot/.env`), so the stage updates land in the same thread the
+request was typed into. A DM's chat id equals the user id, so the first entry
+in `ALLOWED_USER_IDS` is the destination when no `TELEGRAM_CHAT_ID` is set.
+If those credentials are missing it falls back to the tower's bot
+(`@gyndokFinance_bot`, `~/clawd/.env`) — a message in the wrong thread still
+beats silence. Tower alerts and the 07:00 digest stay on the tower bot.
 
 ## Upload auto-retry
 

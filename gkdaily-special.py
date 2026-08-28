@@ -34,6 +34,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -54,8 +55,41 @@ import tower  # noqa: E402
 QUIET = False
 
 
+def notify(msg: str) -> bool:
+    """Send progress through MiniBot's own bot, not the tower's.
+
+    Geffrey asks for an episode by messaging MiniBot, so the stage updates
+    belong in that same thread. The tower and the rest of the clawd tooling
+    use a different bot token, which would put "script written / rendered /
+    live" in a separate conversation from the request that started them.
+
+    A DM's chat id equals the user id, so the first entry in MiniBot's
+    ALLOWED_USER_IDS is the destination. Falls back to the tower's bot if
+    MiniBot's credentials are missing, since a progress message in the wrong
+    thread still beats silence.
+    """
+    try:
+        creds = tower.load_env_creds(Path.home() / "minibot" / ".env")
+        token = creds.get("TELEGRAM_BOT_TOKEN")
+        chat_id = (creds.get("TELEGRAM_CHAT_ID")
+                   or creds.get("ALLOWED_USER_IDS", "").split(",")[0].strip())
+        if token and chat_id:
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=urllib.parse.urlencode(
+                    {"chat_id": chat_id, "text": msg}).encode())
+            urllib.request.urlopen(req, timeout=15)
+            return True
+    except Exception:
+        pass
+    try:
+        return tower.telegram(tower.load_config(), msg)
+    except Exception:
+        return False
+
+
 def say(msg: str, telegram: bool = True) -> None:
-    """One line to stdout, the log, and (by default) Telegram."""
+    """One line to stdout, the log, and (by default) the MiniBot thread."""
     stamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{stamp}] {msg}"
     print(line, flush=True)
@@ -65,10 +99,7 @@ def say(msg: str, telegram: bool = True) -> None:
     except Exception:
         pass
     if telegram and not QUIET:
-        try:
-            tower.telegram(tower.load_config(), msg)
-        except Exception:
-            pass
+        notify(msg)
 
 
 def run(cmd: list, timeout: int) -> subprocess.CompletedProcess:
