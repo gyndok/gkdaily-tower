@@ -122,3 +122,21 @@ symlinked pipeline directory, whether its `/Volumes/...` mount point is
 actually mounted, and whether the path still reads as a directory. It only
 evaluates paths that ARE symlinks, so it stays silent and correct if the
 directories are ever moved back onto the internal disk.
+
+## Nudge give-up guard
+
+The producer nudge re-runs a script the WatchPaths trigger missed. A script
+that is *malformed* rather than merely missed fails identically every time,
+so nudging it turns a dormant leftover into a Telegram alert every
+`retry_min`, forever.
+
+Seen 2026-08-29: `2026-08-27_aging-us-power-grid.md` sat in `scripts/` since
+Aug 27 — a titleless duplicate of an episode already published as
+*The Weakest Link* under the slug `the-aging-us-power-grid`. The producer's
+never-publish-twice guard keys on `special-edition-<slug>-<date>.mp3`, and the
+two slugs differ, so it was never recognised as already produced. It only
+became noisy once the nudge shipped.
+
+`producer_nudge.give_up_after` (default 3) now skips any pending script with
+that many `FAILED <name>` lines in the producer log: it needs a human, not
+another retry. Dead drafts belong in `scripts/rejected/`, which nothing scans.

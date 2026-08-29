@@ -787,6 +787,27 @@ def maybe_nudge_producer(cfg: dict, conn, now: datetime, data: dict) -> None:
         return
     stale = [p for p in sp.get("pending", [])
              if p["age_minutes"] >= cfg_n.get("after_min", 8)]
+    # Never re-run a script the producer has already rejected repeatedly. A
+    # malformed or duplicate script fails identically every time, so nudging
+    # it turns a dormant leftover into a Telegram alert every retry_min,
+    # forever. Seen 2026-08-29: 2026-08-27_aging-us-power-grid.md, a titleless
+    # duplicate of an episode already published under a slightly different
+    # slug, retried until it was moved to scripts/rejected/.
+    give_up = cfg_n.get("give_up_after", 3)
+    if stale:
+        try:
+            log_text = cfg["producer_log"].read_text(errors="replace")
+        except Exception:
+            log_text = ""
+        kept = []
+        for item in stale:
+            if log_text.count(f"FAILED {item['name']}") >= give_up:
+                log.warning("not nudging %s — producer rejected it %d+ times; "
+                            "it needs a human, not another retry",
+                            item["name"], give_up)
+            else:
+                kept.append(item)
+        stale = kept
     if not stale:
         return
     # Never start a second producer on top of a running one.
