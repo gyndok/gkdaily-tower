@@ -106,3 +106,19 @@ markers intact, voice rules respected.
 Note that all three envs (`~/minibot`, `~/podcasts`, `~/clawd`) share ONE
 Anthropic key, so a cap takes out MiniBot's tool loop, the Factory, and the
 briefing's primary tier simultaneously.
+
+## External volume check
+
+On 2026-08-29 `~/podcasts/special-editions` and `~/podcasts/public/episodes`
+were moved to `/Volumes/T7 Shield/Archives` and symlinked back, to free disk
+space. That quietly made an external drive load-bearing for both pipelines,
+and the first symptom was not "the drive is gone" but
+`ModuleNotFoundError: No module named 'tts'` — `render_audio.py` resolved its
+root through the symlink onto the archive, which has no `scripts/`. Fixed
+there by using `.absolute()` instead of `.resolve()`.
+
+The `volumes_mounted` rule (red) now reports the real cause: it checks each
+symlinked pipeline directory, whether its `/Volumes/...` mount point is
+actually mounted, and whether the path still reads as a directory. It only
+evaluates paths that ARE symlinks, so it stays silent and correct if the
+directories are ever moved back onto the internal disk.

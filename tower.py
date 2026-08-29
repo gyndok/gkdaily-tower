@@ -142,6 +142,7 @@ class Collectors:
             "session": self._guard(self.session),
             "substack": self._guard(self.substack),
             "disk": self._guard(self.disk),
+            "volumes": self._guard(self.volumes),
             "log_errors": self._guard(self.log_errors),
         }
 
@@ -312,6 +313,40 @@ class Collectors:
     def disk(self) -> dict:
         usage = shutil.disk_usage(Path.home())
         return {"free_gb": round(usage.free / 1e9, 1)}
+
+    # -- external volumes the pipeline now depends on ------------------------
+    def volumes(self) -> dict:
+        """Check that symlinked pipeline directories still resolve.
+
+        On 2026-08-29 ~/podcasts/special-editions and ~/podcasts/public/episodes
+        were moved to /Volumes/T7 Shield/Archives and symlinked back, to free
+        disk. That silently made an external drive load-bearing: unplug it and
+        renders fail, the briefing cannot write its mp3, and the symptom is an
+        obscure ModuleNotFoundError rather than "the drive is gone". This turns
+        that into a named cause.
+
+        Only reports on paths that ARE symlinks, so it stays quiet — and
+        correct — if the directories are ever moved back onto the internal
+        disk.
+        """
+        out = []
+        root = self.cfg["podcasts_root"]
+        for rel in ("special-editions", "public/episodes"):
+            path = root / rel
+            if not path.is_symlink():
+                continue
+            target = Path(os.readlink(path))
+            mount = None
+            if str(target).startswith("/Volumes/"):
+                mount = "/" + "/".join(str(target).split("/")[1:3])
+            out.append({
+                "path": rel,
+                "target": str(target),
+                "mount": mount,
+                "mounted": Path(mount).is_mount() if mount else True,
+                "readable": path.is_dir(),
+            })
+        return {"links": out}
 
     # -- error lines from today's logs (surface, don't re-alert) -------------
     def log_errors(self) -> dict:
@@ -500,7 +535,20 @@ def evaluate(cfg: dict, col: Collectors, data: dict, now: datetime) -> list:
     add("disk_space", "Disk space", ok, now, severity="yellow",
         detail=f"{dk.get('free_gb')} GB free")
 
-    # 10. today's log errors — info only; the pipelines alert these themselves
+    # 10. external volumes backing the pipeline (red — nothing can render)
+    vol = data["volumes"]
+    links = vol.get("links", []) if "error" not in vol else []
+    broken = [l for l in links if not (l["mounted"] and l["readable"])]
+    if links:  # only meaningful once something is symlinked off the internal disk
+        add("volumes_mounted", "External episode volume",
+            None if "error" in vol else not broken, now, severity="red",
+            detail=(f"{broken[0]['mount'] or broken[0]['target']} not available "
+                    f"— {broken[0]['path']} is unreachable, renders and the "
+                    f"briefing will fail" if broken else
+                    f"{links[0]['mount'] or 'symlinked'} mounted, "
+                    f"{len(links)} path(s) resolving"))
+
+    # 11. today's log errors — info only; the pipelines alert these themselves
     le = data["log_errors"]
     errs = le.get("today", []) if "error" not in le else []
     add("log_errors", "Today's log errors",
