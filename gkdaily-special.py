@@ -239,7 +239,20 @@ def main() -> int:
                    help="produce the top uncovered topic from the topics doc")
     g.add_argument("--status", action="store_true")
     ap.add_argument("--quiet", action="store_true", help="no Telegram messages")
+    ap.add_argument("--detach", action="store_true",
+                    help="run in a new session, surviving the caller's exit")
     args = ap.parse_args()
+
+    # MiniBot launches this with nohup, but a nohup'd child stays in the
+    # caller's PROCESS GROUP — and `launchctl kickstart -k` SIGKILLs the whole
+    # group. Restarting MiniBot therefore killed a running episode outright
+    # (2026-08-29: the Cascadia run died mid-research, 2 minutes in, with no
+    # error anywhere). setsid() puts the run in its own session so nothing
+    # aimed at MiniBot can reach it.
+    if args.detach:
+        if os.fork() > 0:
+            return 0
+        os.setsid()
     QUIET = args.quiet
     cfg = tower.load_config()
 

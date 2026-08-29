@@ -28,8 +28,8 @@ fi
 # "make the next gk daily special" -> top uncovered topic from the topics doc
 if echo "$MESSAGE" | grep -qiE "^(make|produce|run|do) (the )?next gk ?daily( special)?|^next gk ?daily|^gk ?daily next"; then
     echo ">> GK Daily special — next topic from the queue"
-    nohup "$CLAWD_DIR/gkdaily-special.py" --next \
-        >> "$HOME/Library/Logs/gkdaily-special.log" 2>&1 &
+    "$CLAWD_DIR/gkdaily-special.py" --detach --next \
+        >> "$HOME/Library/Logs/gkdaily-special.log" 2>&1
     echo "   Started. Telegram will report each stage (~12-15 min to live)."
     exit 0
 fi
@@ -39,12 +39,12 @@ if echo "$MESSAGE" | grep -qiE "gk ?daily special|special edition|special episod
     TOPIC=$(echo "$MESSAGE" | sed -E 's/.*(gk ?daily special|special edition|special episode)//I; s/^ *(on|about|regarding|covering|re) +//I; s/^[:,-] *//; s/ *[.!?]* *$//')
     if [ -z "$TOPIC" ]; then
         echo ">> No topic given — using the next one from the queue"
-        nohup "$CLAWD_DIR/gkdaily-special.py" --next \
-            >> "$HOME/Library/Logs/gkdaily-special.log" 2>&1 &
+        "$CLAWD_DIR/gkdaily-special.py" --detach --next \
+            >> "$HOME/Library/Logs/gkdaily-special.log" 2>&1
     else
         echo ">> GK Daily special on: $TOPIC"
-        nohup "$CLAWD_DIR/gkdaily-special.py" --topic "$TOPIC" \
-            >> "$HOME/Library/Logs/gkdaily-special.log" 2>&1 &
+        "$CLAWD_DIR/gkdaily-special.py" --detach --topic "$TOPIC" \
+            >> "$HOME/Library/Logs/gkdaily-special.log" 2>&1
     fi
     echo "   Started. Telegram will report each stage (~12-15 min to live)."
     exit 0
