@@ -194,10 +194,17 @@ class Collectors:
         pending = [{"name": p.name,
                     "age_minutes": round((time.time() - p.stat().st_mtime) / 60)}
                    for p in eps.glob("*.mp3") if p.name not in state]
+        # upload_spotify.py tags an entry " UNVERIFIED" when the episode was
+        # published but never appeared in the Creators list. It alerts once;
+        # a one-time message is exactly what went unnoticed on 2026-08-29, so
+        # the tag is surfaced here as a standing condition until resolved.
+        unverified = [{"name": n, "ts": ts} for n, ts in state.items()
+                      if "UNVERIFIED" in ts]
         return {
             "total": len(state),
             "today": todays,
             "pending": pending,
+            "unverified": unverified,
             "briefing_uploaded_at": next(
                 (ts for n, ts in todays.items() if n.startswith("gk_daily_")),
                 None),
@@ -384,6 +391,17 @@ class Collectors:
             return None
 
 
+def ledger_ts(ts: str) -> str:
+    """The bare ISO timestamp from a ledger value.
+
+    upload_spotify.py appends " UNVERIFIED" to entries it published but could
+    not confirm in Spotify Creators. The suffix keeps ts.startswith(date)
+    working, but fromisoformat() rejects it — which broke the live-verification
+    rules the moment the first tagged entry appeared (2026-08-30).
+    """
+    return (ts or "").split(" ")[0]
+
+
 def iso_mtime(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -486,7 +504,8 @@ def evaluate(cfg: dict, col: Collectors, data: dict, now: datetime) -> list:
         titles = col.rss_titles()
         window = timedelta(minutes=cfg["verify_window_minutes"])
         for name, ts in sorted(led["today"].items()):
-            due = datetime.fromisoformat(ts).replace(tzinfo=now.tzinfo) + window
+            due = (datetime.fromisoformat(ledger_ts(ts))
+                   .replace(tzinfo=now.tzinfo) + window)
             want = expected_title(name, special_meta)
             ok = None if titles is None or want is None else want in titles
             add(f"live:{name}", f"Live on Spotify: {name}",
@@ -534,6 +553,21 @@ def evaluate(cfg: dict, col: Collectors, data: dict, now: datetime) -> list:
     ok = None if "error" in dk else dk["free_gb"] > cfg["disk_min_free_gb"]
     add("disk_space", "Disk space", ok, now, severity="yellow",
         detail=f"{dk.get('free_gb')} GB free")
+
+    # 9b. episodes published but never confirmed in Spotify Creators (red).
+    # These are NOT auto-retried — a false negative would double-publish — so
+    # they stay red until a human checks and clears the tag.
+    unver = data["ledger"].get("unverified", []) if "error" not in data["ledger"] else []
+    grace = timedelta(minutes=cfg.get("unverified_grace_min", 60))
+    unver = [u for u in unver
+             if datetime.fromisoformat(ledger_ts(u["ts"])).replace(
+                 tzinfo=now.tzinfo) + grace < now]
+    if unver:
+        add("uploads_unverified", "Spotify uploads unconfirmed", False, now,
+            severity="red",
+            detail=f"{unver[0]['name']} published but not found in Creators"
+                   + (f" (+{len(unver) - 1} more)" if len(unver) > 1 else "")
+                   + " — check creators.spotify.com; not retried automatically")
 
     # 10. external volumes backing the pipeline (red — nothing can render)
     vol = data["volumes"]
@@ -912,10 +946,60 @@ LATEST: dict = {}          # last tick's full status, served by HTTP
 LATEST_LOCK = threading.Lock()
 
 
+def reconcile_unverified(cfg: dict, col, data: dict, now: datetime) -> None:
+    """Clear the UNVERIFIED tag once the episode really does show up.
+
+    The uploader can only wait so long before returning, and Spotify's ingest
+    is slower than that: the 2026-08-30 telescope episode published fine but
+    took longer than the uploader's window to appear, so it got tagged. A tag
+    that never clears is a false alarm, and false alarms are how a real one
+    gets ignored.
+
+    The tower already polls the public feed, so it is the right place to
+    settle the question: found in the feed -> drop the tag; still absent after
+    unverified_grace_min -> the rule stays red and means something.
+    """
+    led = data.get("ledger", {})
+    unver = led.get("unverified", []) if "error" not in led else []
+    if not unver:
+        return
+    titles = col.rss_titles()
+    if titles is None:
+        return
+    meta_path = (cfg["podcasts_root"] / "public" / "episodes"
+                 / "special_editions.json")
+    try:
+        special_meta = json.loads(meta_path.read_text())
+    except Exception:
+        special_meta = {}
+    path = cfg["podcasts_root"] / "config" / "spotify_uploaded.json"
+    try:
+        state = json.loads(path.read_text())
+    except Exception:
+        return
+    cleared = []
+    for entry in unver:
+        want = expected_title(entry["name"], special_meta)
+        if want and want in titles:
+            state[entry["name"]] = entry["ts"].split(" ")[0]
+            cleared.append(entry["name"])
+    if cleared:
+        path.write_text(json.dumps(state, indent=2) + "\n")
+        log.info("cleared UNVERIFIED tag (now live): %s", ", ".join(cleared))
+        telegram(cfg, "✅ GK Daily: " + ", ".join(cleared) +
+                 " turned up on Spotify after all — the unconfirmed-upload "
+                 "flag is cleared. Slow ingest, not a lost episode.")
+
+
 def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
     now = datetime.now(ZoneInfo(cfg["timezone"]))
     col = Collectors(cfg, now)
     data = col.collect()
+    try:  # settle any stale UNVERIFIED tags before judging them
+        reconcile_unverified(cfg, col, data, now)
+        data = col.collect()
+    except Exception:
+        log.exception("unverified reconciliation failed")
     rules = evaluate(cfg, col, data, now)
     process_alerts(cfg, conn, rules, now, quiet=quiet)
     maybe_digest(cfg, conn, rules, data, now, quiet=quiet)

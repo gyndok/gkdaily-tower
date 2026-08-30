@@ -66,5 +66,6 @@
     "enabled": true,
     "after_min": 20,
     "retry_min": 30
-  }
+  },
+  "unverified_grace_min": 60
 }

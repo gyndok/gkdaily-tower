@@ -140,3 +140,26 @@ became noisy once the nudge shipped.
 `producer_nudge.give_up_after` (default 3) now skips any pending script with
 that many `FAILED <name>` lines in the producer log: it needs a human, not
 another retry. Dead drafts belong in `scripts/rejected/`, which nothing scans.
+
+## Unconfirmed uploads
+
+`upload_spotify.py` proves a publish by polling the Creators episode list for
+the title, because "the wizard navigated away" is not proof — on 2026-08-29 an
+upload cleared every step, the ledger recorded success, and the episode
+existed nowhere. An upload it cannot confirm is tagged `" UNVERIFIED"` on its
+ledger timestamp and never auto-retried (a false negative would double-publish).
+
+Two things make that tag trustworthy rather than noise:
+
+- **`ledger_ts()`** strips the suffix before `fromisoformat()`. The tag keeps
+  `ts.startswith(date)` working, but it broke the live-verification rules the
+  moment the first tagged entry appeared.
+- **`reconcile_unverified()`** clears the tag once the episode does show up in
+  the public feed. Spotify's ingest is slower than any window the uploader can
+  afford to wait: the 2026-08-30 telescope episode published fine and was
+  tagged anyway. A tag that never clears is a false alarm, and false alarms are
+  how a real one gets ignored.
+
+The `uploads_unverified` rule (red) only fires after `unverified_grace_min`
+(default 60), so it means "published an hour ago and still nowhere" — worth
+opening creators.spotify.com for.
