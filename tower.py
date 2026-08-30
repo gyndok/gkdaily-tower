@@ -143,6 +143,7 @@ class Collectors:
             "substack": self._guard(self.substack),
             "disk": self._guard(self.disk),
             "volumes": self._guard(self.volumes),
+            "scripts_archive": self._guard(self.scripts_archive),
             "log_errors": self._guard(self.log_errors),
         }
 
@@ -320,6 +321,41 @@ class Collectors:
     def disk(self) -> dict:
         usage = shutil.disk_usage(Path.home())
         return {"free_gb": round(usage.free / 1e9, 1)}
+
+    # -- script archive completeness -----------------------------------------
+    def scripts_archive(self) -> dict:
+        """Published episodes whose script never reached Drive.
+
+        Episodes made through the older direct-render path write straight into
+        special-editions/<slug>/ and never deliver markdown to the Drive drop
+        folder, so the archive silently loses the source. Found 2026-08-30:
+        five episodes going back to 08-16, spotted by eye rather than by any
+        check. The mp3 is janitored after media_retention_days, so the episode
+        METADATA is the durable list to compare against, not the audio.
+        """
+        meta_path = (self.cfg["podcasts_root"] / "public" / "episodes"
+                     / "special_editions.json")
+        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        proc = self.cfg["drive_gk_daily"] / "scripts" / "processed"
+        have = set()
+        if proc.is_dir():
+            for f in proc.glob("*.md"):
+                have.add(re.sub(r"^\d{4}-\d{2}-\d{2}_", "", f.stem))
+        missing = []
+        for name in meta:
+            m = re.match(r"special-edition-(.+)-(\d{4}-\d{2}-\d{2})\.mp3$", name)
+            if not m:
+                continue
+            slug, date = m.group(1), m.group(2)
+            if slug in have:
+                continue
+            # recoverable if the rendered text survives locally
+            txt = (self.cfg["podcasts_root"] / "special-editions" / slug
+                   / "script.txt")
+            missing.append({"slug": slug, "date": date,
+                            "recoverable": txt.is_file()})
+        missing.sort(key=lambda x: x["date"])
+        return {"episodes": len(meta), "missing": missing}
 
     # -- external volumes the pipeline now depends on ------------------------
     def volumes(self) -> dict:
@@ -568,6 +604,20 @@ def evaluate(cfg: dict, col: Collectors, data: dict, now: datetime) -> list:
             detail=f"{unver[0]['name']} published but not found in Creators"
                    + (f" (+{len(unver) - 1} more)" if len(unver) > 1 else "")
                    + " — check creators.spotify.com; not retried automatically")
+
+    # 9c. published episodes with no script in the Drive archive (yellow —
+    # nothing is broken, but the source is only recoverable while the local
+    # rendered text survives).
+    sa = data["scripts_archive"]
+    miss = sa.get("missing", []) if "error" not in sa else []
+    if "error" not in sa:
+        lost = [m for m in miss if not m["recoverable"]]
+        add("scripts_archived", "Scripts archived to Drive", not miss, now,
+            severity="yellow",
+            detail=(f"{len(miss)} episode(s) with no script in processed/ — "
+                    f"oldest {miss[0]['date']} {miss[0]['slug']}; "
+                    f"{len(lost)} unrecoverable" if miss else
+                    f"all {sa.get('episodes', 0)} episodes have a script"))
 
     # 10. external volumes backing the pipeline (red — nothing can render)
     vol = data["volumes"]

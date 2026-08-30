@@ -163,3 +163,25 @@ Two things make that tag trustworthy rather than noise:
 The `uploads_unverified` rule (red) only fires after `unverified_grace_min`
 (default 60), so it means "published an hour ago and still nowhere" — worth
 opening creators.spotify.com for.
+
+## Script archive completeness
+
+Episodes made through the older direct-render path write straight into
+`special-editions/<slug>/` and never deliver markdown to the Drive drop
+folder, so the archive silently loses the source. Found 2026-08-30 by eye,
+not by any check: seven episodes going back to 08-09.
+
+The `scripts_archived` rule (yellow) compares published episodes against
+`scripts/processed/`. It counts from the episode **metadata**, not the mp3s —
+the media janitor deletes local audio after `media_retention_days`, so the
+audio is not the durable list. It also reports how many are *unrecoverable*:
+while `special-editions/<slug>/script.txt` survives, the spoken text can be
+reconstructed; once that is gone, so is the script.
+
+Recovery is faithful but lossy in one respect. `script.txt` is written after
+`strip_sources()`, so the `--- SOURCES ---` block is gone for good; the
+`# Title` line comes back from `special_editions.json`. Verified across all
+seven recovered scripts: zero pronunciation respellings were baked in (they
+are applied at the same write, so this had to be checked, not assumed) and
+every `[pause]` marker survived. Reconstructed files say so in their SOURCES
+block rather than leaving a silent gap.
