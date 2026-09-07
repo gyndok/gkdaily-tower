@@ -5,7 +5,8 @@ GK Daily Control Tower — P4 Script Factory (failover-only).
 If no special-edition script has landed in Drive by factory.failover_at on a
 weekday, the tower runs this to write one ON the mini: pick the top uncovered
 topic (same priority order as the cloud-side skill: topics gdoc, then
-queue.json candidates), research and write it with Claude Opus 5 + web search,
+queue.json candidates), research and write it with Claude (config.factory.model,
+Sonnet 5 since the 2026-09-07 cost audit) + web search,
 and drop the finished YYYY-MM-DD_slug.md into GK Daily/scripts/ — where the
 existing WatchPaths producer takes over untouched. The cloud-side scheduled
 task remains the preferred author; this is the guarantee behind it.
@@ -270,10 +271,15 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
         raise RuntimeError("ANTHROPIC_API_KEY not found")
     client = anthropic.Anthropic(api_key=api_key, timeout=900.0)
 
-    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 10}]
+    # 2026-09-07 cost audit: every search round re-sends the accumulated
+    # results, so max_uses is the main cost lever (10 → 6). Same audit moved
+    # config.factory.model from claude-opus-5 to claude-sonnet-5.
+    tools = [{"type": "web_search_20260209", "name": "web_search",
+              "max_uses": int(cfg["factory"].get("web_search_max_uses", 6))}]
     messages = [{"role": "user", "content": user_prompt}]
 
     response = None
+    total_in = total_out = total_searches = 0
     for round_no in range(8):  # server tool loop can pause; resume until done
         with client.messages.stream(
             model=cfg["factory"]["model"],
@@ -283,8 +289,15 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
             messages=messages,
         ) as stream:
             response = stream.get_final_message()
-        log.info("round %d: stop_reason=%s, output_tokens=%s", round_no,
-                 response.stop_reason, response.usage.output_tokens)
+        u = response.usage
+        stu = getattr(u, "server_tool_use", None)
+        searches = getattr(stu, "web_search_requests", 0) or 0
+        total_in += u.input_tokens
+        total_out += u.output_tokens
+        total_searches += searches
+        log.info("round %d: stop_reason=%s, input_tokens=%s, output_tokens=%s, "
+                 "web_searches=%s", round_no, response.stop_reason,
+                 u.input_tokens, u.output_tokens, searches)
         if response.stop_reason == "refusal":
             raise RuntimeError("model declined the request (stop_reason=refusal)")
         if response.stop_reason != "pause_turn":
@@ -293,6 +306,12 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
                     {"role": "assistant", "content": response.content}]
     else:
         raise RuntimeError("generation did not finish within 8 pause_turn rounds")
+
+    prices = {"claude-opus-5": (5.0, 25.0), "claude-sonnet-5": (3.0, 15.0)}
+    p_in, p_out = prices.get(cfg["factory"]["model"], (3.0, 15.0))
+    est = (total_in * p_in + total_out * p_out) / 1_000_000 + total_searches * 0.01
+    log.info("factory usage: model=%s input=%d output=%d web_searches=%d est_cost=$%.2f",
+             cfg["factory"]["model"], total_in, total_out, total_searches, est)
 
     return "\n".join(b.text for b in response.content if b.type == "text")
 

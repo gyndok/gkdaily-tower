@@ -26,8 +26,8 @@
   "topic_queue_doc": "https://docs.google.com/document/d/1o3r_j32j_6dnq-M55K74Kbenbotgr7PvXLiuWM3soL8/edit",
   "topic_queue_json": "~/Library/CloudStorage/GoogleDrive-gyndok@gmail.com/My Drive/GK Daily/queue.json",
   "factory": {
-    "failover_at": "07:30",
-    "model": "claude-opus-5",
+    "failover_at": "08:05",
+    "model": "claude-sonnet-5",
     "python": "~/podcasts/venv/bin/python3",
     "podcasts_env": "~/podcasts/.env",
     "target_words": 3700,

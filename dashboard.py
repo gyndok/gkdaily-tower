@@ -165,7 +165,7 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
                        str(Path(__file__).resolve().parent / "scout.py"),
                        "--run"], 1200)  # 3 model attempts + feeds + gdoc
     if name == "run_factory_staged":
-        # Full research+write on Claude Opus 5, but the script lands in
+        # Full research+write on config.factory.model (Sonnet 5), but the script lands in
         # staging/ — nothing reaches the pipeline. For testing/previewing.
         return _spawn(name, arg,
                       [str(Path(CFG["factory"]["python"]).expanduser()),
@@ -619,7 +619,7 @@ def render_page() -> str:
 {button("Producer dry-run", "producer_dry_run")}
 {button("Rotate logs", "rotate_logs")}
 {button("Script Factory test (staged)", "run_factory_staged", "",
-        "Generate a full script with Claude Opus 5 into staging/ (costs ~$1, publishes nothing)?")}</p>
+        "Generate a full script with the factory model (Sonnet 5) into staging/ (costs ~$1, publishes nothing)?")}</p>
 <p><b>Scripts in Drive</b></p>
 <table>{script_rows}</table>
 
