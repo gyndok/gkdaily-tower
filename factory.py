@@ -266,7 +266,12 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
     import anthropic  # only available in the podcasts venv
 
     creds = tower.load_env_creds(Path(cfg["factory"]["podcasts_env"]).expanduser())
-    api_key = creds.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    # FACTORY_ANTHROPIC_API_KEY (dedicated "gkdaily-factory" key, so specials
+    # show as their own line in the Console) wins over the podcast's key.
+    api_key = (creds.get("FACTORY_ANTHROPIC_API_KEY")
+               or os.environ.get("FACTORY_ANTHROPIC_API_KEY")
+               or creds.get("ANTHROPIC_API_KEY")
+               or os.environ.get("ANTHROPIC_API_KEY"))
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not found")
     client = anthropic.Anthropic(api_key=api_key, timeout=900.0)
