@@ -328,8 +328,8 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
     else:
         raise RuntimeError("generation did not finish within 8 pause_turn rounds")
 
-    prices = {"claude-opus-5": (5.0, 25.0), "claude-sonnet-5": (3.0, 15.0)}
-    p_in, p_out = prices.get(cfg["factory"]["model"], (3.0, 15.0))
+    prices = {"claude-opus-5": (5.0, 25.0), "claude-sonnet-5": (2.0, 10.0)}
+    p_in, p_out = prices.get(cfg["factory"]["model"], (2.0, 10.0))
     est = (total_in * p_in + total_cw * p_in * 1.25 + total_cr * p_in * 0.1
            + total_out * p_out) / 1_000_000 + total_searches * 0.01
     # Printed to stdout as well so tower.maybe_failover can lift it into its
