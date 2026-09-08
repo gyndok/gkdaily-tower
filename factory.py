@@ -281,15 +281,26 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
     # config.factory.model from claude-opus-5 to claude-sonnet-5.
     tools = [{"type": "web_search_20260209", "name": "web_search",
               "max_uses": int(cfg["factory"].get("web_search_max_uses", 6))}]
-    messages = [{"role": "user", "content": user_prompt}]
+    # 2026-09-08: cache the system prompt and the user prompt so the web_search
+    # rounds re-read the prefix at 0.1x instead of resending it at full price
+    # (the API auto-adds cache writes after each search result once caching is
+    # on). Sonnet 5's minimum cacheable prefix is 1024 tokens; system+user is
+    # comfortably above that.
+    cache = {"type": "ephemeral"}
+    system_blocks = [{"type": "text",
+                      "text": SYSTEM.replace("{words}", str(cfg["factory"]["target_words"])),
+                      "cache_control": cache}]
+    user_msg = {"role": "user", "content": [
+        {"type": "text", "text": user_prompt, "cache_control": cache}]}
+    messages = [user_msg]
 
     response = None
-    total_in = total_out = total_searches = 0
+    total_in = total_out = total_searches = total_cr = total_cw = 0
     for round_no in range(8):  # server tool loop can pause; resume until done
         with client.messages.stream(
             model=cfg["factory"]["model"],
             max_tokens=32000,
-            system=SYSTEM.replace("{words}", str(cfg["factory"]["target_words"])),
+            system=system_blocks,
             tools=tools,
             messages=messages,
         ) as stream:
@@ -297,26 +308,38 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
         u = response.usage
         stu = getattr(u, "server_tool_use", None)
         searches = getattr(stu, "web_search_requests", 0) or 0
+        cr = getattr(u, "cache_read_input_tokens", 0) or 0
+        cw = getattr(u, "cache_creation_input_tokens", 0) or 0
         total_in += u.input_tokens
         total_out += u.output_tokens
         total_searches += searches
+        total_cr += cr
+        total_cw += cw
         log.info("round %d: stop_reason=%s, input_tokens=%s, output_tokens=%s, "
-                 "web_searches=%s", round_no, response.stop_reason,
-                 u.input_tokens, u.output_tokens, searches)
+                 "cache_read=%s, cache_write=%s, web_searches=%s", round_no,
+                 response.stop_reason, u.input_tokens, u.output_tokens, cr, cw,
+                 searches)
         if response.stop_reason == "refusal":
             raise RuntimeError("model declined the request (stop_reason=refusal)")
         if response.stop_reason != "pause_turn":
             break
-        messages = [{"role": "user", "content": user_prompt},
+        messages = [user_msg,
                     {"role": "assistant", "content": response.content}]
     else:
         raise RuntimeError("generation did not finish within 8 pause_turn rounds")
 
     prices = {"claude-opus-5": (5.0, 25.0), "claude-sonnet-5": (3.0, 15.0)}
     p_in, p_out = prices.get(cfg["factory"]["model"], (3.0, 15.0))
-    est = (total_in * p_in + total_out * p_out) / 1_000_000 + total_searches * 0.01
-    log.info("factory usage: model=%s input=%d output=%d web_searches=%d est_cost=$%.2f",
-             cfg["factory"]["model"], total_in, total_out, total_searches, est)
+    est = (total_in * p_in + total_cw * p_in * 1.25 + total_cr * p_in * 0.1
+           + total_out * p_out) / 1_000_000 + total_searches * 0.01
+    # Printed to stdout as well so tower.maybe_failover can lift it into its
+    # own log (a successful subprocess's stderr was previously discarded).
+    summary = ("factory usage: model=%s input=%d cache_read=%d cache_write=%d "
+               "output=%d web_searches=%d est_cost=$%.2f" % (
+                   cfg["factory"]["model"], total_in, total_cr, total_cw,
+                   total_out, total_searches, est))
+    log.info(summary)
+    print(summary, flush=True)
 
     return "\n".join(b.text for b in response.content if b.type == "text")
 
@@ -409,7 +432,12 @@ def maybe_failover(cfg: dict, conn, now: datetime, data: dict) -> None:
                 [str(Path(cfg["factory"]["python"]).expanduser()),
                  str(Path(__file__).resolve()), "--run"],
                 capture_output=True, text=True, timeout=1800)
-            result = ("ok: " + proc.stdout.strip()[-200:]) if proc.returncode == 0 \
+            out_lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+            for ln in out_lines:
+                if ln.startswith("factory usage:"):
+                    log.info(ln)  # keep the cost line even on success
+            tail = out_lines[-1] if out_lines else ""
+            result = ("ok: " + tail[-200:]) if proc.returncode == 0 \
                 else f"failed rc={proc.returncode}: {proc.stderr.strip()[-300:]}"
         except Exception as exc:
             result = f"failed: {exc}"
