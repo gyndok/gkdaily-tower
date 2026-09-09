@@ -340,7 +340,11 @@ class Collectors:
         have = set()
         if proc.is_dir():
             for f in proc.glob("*.md"):
-                have.add(re.sub(r"^\d{4}-\d{2}-\d{2}_", "", f.stem))
+                # The producer appends _HHMMSS when a same-named script is
+                # already archived (2026-09-09_keytruda-..._095348.md), which
+                # made this rule flag an episode whose script was right there.
+                stem = re.sub(r"_\d{6}$", "", f.stem)
+                have.add(re.sub(r"^\d{4}-\d{2}-\d{2}_", "", stem))
         missing = []
         for name in meta:
             m = re.match(r"special-edition-(.+)-(\d{4}-\d{2}-\d{2})\.mp3$", name)
