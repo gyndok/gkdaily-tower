@@ -33,7 +33,8 @@
     "target_words": 3700,
     "staging_dir": "~/gkdaily-tower/staging",
     "fallback_model": "kimi-k2.6",
-    "minibot_env": "~/minibot/.env"
+    "minibot_env": "~/minibot/.env",
+    "allow_unresearched_fallback": false
   },
   "scout": {
     "run_at": "21:00",

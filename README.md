@@ -1,5 +1,12 @@
 # GK Daily Control Tower
 
+**2026-09-09 hardening:** detached requests now use a durable queue; uploads
+run headless with a pre-publish uncertainty record; producer and ledger writes
+are serialized. See [audit, operation and rollback notes](docs/HARDENING-2026-09-09.md).
+The historical implementation notes below describe earlier behavior where they differ.
+
+Run offline checks with `python3 -m unittest discover -s tests -q`.
+
 Supervisor for the GK Daily podcast pipelines on the Mac mini. Stdlib-only
 Python (no venv for the tower itself), SQLite state, launchd-managed
 (`com.geffrey.gkdaily-tower`, KeepAlive). Dashboard at `/tower/` on the

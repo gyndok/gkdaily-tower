@@ -17,6 +17,7 @@ never pass through here — re-login stays a terminal job by design.
 """
 
 import html
+import secrets
 import json
 import logging
 import re
@@ -34,6 +35,7 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger("tower.dash")
 
 # set by init()
+CSRF_TOKEN = secrets.token_urlsafe(32)
 CFG: dict = {}
 DB_PATH: Path = None
 GET_STATUS = lambda: {}
@@ -486,6 +488,7 @@ CSS = """
 def button(label: str, action: str, arg: str = "", confirm: str = "") -> str:
     onsubmit = f' onsubmit="return confirm(\'{esc(confirm)}\')"' if confirm else ""
     return (f'<form method="post" action="action"{onsubmit}>'
+            f'<input type="hidden" name="csrf" value="{CSRF_TOKEN}">'
             f'<input type="hidden" name="name" value="{esc(action)}">'
             f'<input type="hidden" name="arg" value="{esc(arg)}">'
             f'<button>{esc(label)}</button></form>')
@@ -629,6 +632,7 @@ Topics doc</a>, in order — the top uncovered line is what the 5 AM task (or th
 Script Factory failover) produces next. {esc(upcoming_note)}</p>
 <table>{upcoming_html}</table>
 <form method="post" action="action" style="margin:.6rem 0">
+<input type="hidden" name="csrf" value="{CSRF_TOKEN}">
 <input type="hidden" name="name" value="add_topic">
 <input name="arg" size="44" maxlength="200" required
  placeholder="new-topic — angle, angle, angle">
@@ -643,6 +647,7 @@ to add at the end. Writes straight into the topics doc.</small>
 to the <a href="{esc(CFG.get("topic_queue_doc", "#"))}">GK Daily Topics doc</a>
 (source of truth). {button("Run Scout now", "run_scout")}</p>
 <form method="post" action="action">
+<input type="hidden" name="csrf" value="{CSRF_TOKEN}">
 <input type="hidden" name="name" value="batch_topics">
 <table>{prop_rows}</table>
 {batch_controls}
@@ -674,6 +679,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -706,8 +714,19 @@ class Handler(BaseHTTPRequestHandler):
         if not path.endswith("/action"):
             self._send(b"not found", "text/plain", 404)
             return
-        length = int(self.headers.get("Content-Length", 0))
-        form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 16384:
+                raise ValueError("invalid request size")
+            self.connection.settimeout(10)
+            form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        except (ValueError, UnicodeError, OSError):
+            self._send(b"invalid request", "text/plain", 400)
+            return
+        token = (form.get("csrf") or [""])[0]
+        if not secrets.compare_digest(token.encode(), CSRF_TOKEN.encode()):
+            self._send(b"reload the dashboard before submitting", "text/plain", 403)
+            return
         name = (form.get("name") or [""])[0]
         arg = (form.get("arg") or [""])[0]
         dispatch(name, arg, form)

@@ -27,6 +27,7 @@ Usage:
 """
 
 import argparse
+from reliability import atomic_json, exclusive_lock
 import json
 import logging
 import os
@@ -1027,18 +1028,24 @@ def reconcile_unverified(cfg: dict, col, data: dict, now: datetime) -> None:
     except Exception:
         special_meta = {}
     path = cfg["podcasts_root"] / "config" / "spotify_uploaded.json"
-    try:
-        state = json.loads(path.read_text())
-    except Exception:
-        return
     cleared = []
-    for entry in unver:
-        want = expected_title(entry["name"], special_meta)
-        if want and want in titles:
-            state[entry["name"]] = entry["ts"].split(" ")[0]
-            cleared.append(entry["name"])
+    try:
+        with exclusive_lock(cfg["podcasts_root"] / ".spotify-upload.lock", blocking=False):
+            state = json.loads(path.read_text())
+            for entry in unver:
+                want = expected_title(entry["name"], special_meta)
+                current = state.get(entry["name"], "")
+                if want and want in titles and current.endswith(" UNVERIFIED"):
+                    state[entry["name"]] = current.removesuffix(" UNVERIFIED")
+                    cleared.append(entry["name"])
+            if cleared:
+                atomic_json(path, state)
+    except BlockingIOError:
+        return  # uploader owns the ledger; reconcile on the next tick
+    except (OSError, ValueError):
+        log.exception("could not reconcile upload ledger")
+        return
     if cleared:
-        path.write_text(json.dumps(state, indent=2) + "\n")
         log.info("cleared UNVERIFIED tag (now live): %s", ", ".join(cleared))
         telegram(cfg, "✅ GK Daily: " + ", ".join(cleared) +
                  " turned up on Spotify after all — the unconfirmed-upload "
@@ -1049,14 +1056,22 @@ def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
     now = datetime.now(ZoneInfo(cfg["timezone"]))
     col = Collectors(cfg, now)
     data = col.collect()
-    try:  # settle any stale UNVERIFIED tags before judging them
-        reconcile_unverified(cfg, col, data, now)
-        data = col.collect()
-    except Exception:
-        log.exception("unverified reconciliation failed")
+    if not quiet:
+        try:  # settle any stale UNVERIFIED tags before judging them
+            reconcile_unverified(cfg, col, data, now)
+            data = col.collect()
+        except Exception:
+            log.exception("unverified reconciliation failed")
     rules = evaluate(cfg, col, data, now)
     process_alerts(cfg, conn, rules, now, quiet=quiet)
     maybe_digest(cfg, conn, rules, data, now, quiet=quiet)
+
+    if not quiet:
+        try:
+            import jobs
+            jobs.maybe_start(cfg)
+        except Exception:
+            log.exception("job worker start failed")
 
     if not quiet:  # topic scout: nightly proposals + auto-approve sweep
         try:

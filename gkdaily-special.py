@@ -23,7 +23,8 @@ Usage (safe to call from MiniBot's run_shell, a phone, or ssh):
     gkdaily-special.py --status        # what is in flight, what published today
     gkdaily-special.py --next --quiet  # no Telegram, just stdout
 
-Exit codes: 0 published & verified, 1 failed, 2 already running, 3 no topic.
+Exit codes: 0 verified (or durably queued with --detach), 1 failed, 2 busy,
+3 no topic, 4 awaiting feed verification.
 Progress goes to Telegram at each milestone so a phone shows the same story.
 """
 
@@ -42,13 +43,14 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-TOWER = Path.home() / "gkdaily-tower"
+TOWER = Path(__file__).resolve().parent
 CLAWD = Path.home() / "clawd"
 PODCASTS = Path.home() / "podcasts"
 LOCK = CLAWD / ".gkdaily-special.lock"
 LOG = Path.home() / "Library" / "Logs" / "gkdaily-special.log"
 
 sys.path.insert(0, str(TOWER))
+import jobs
 import factory  # noqa: E402  (tower modules; stdlib-only except factory's SDK)
 import scout  # noqa: E402
 import tower  # noqa: E402
@@ -120,8 +122,10 @@ def run(cmd: list, timeout: int) -> subprocess.CompletedProcess:
 
 def resolve_topic(cfg: dict, explicit: str | None) -> dict:
     """An explicit topic wins; otherwise the top uncovered line in the doc."""
-    if explicit:
+    if explicit is not None:
         line = " ".join(explicit.split())
+        if not line:
+            raise RuntimeError("topic must not be empty")
         if factory.is_covered(line, factory.covered_topics(cfg)):
             raise SystemExit(f"'{line}' looks like an episode that already "
                              "exists. Pick a different angle, or delete the "
@@ -144,19 +148,16 @@ def produce(script_path: Path) -> None:
         raise RuntimeError("producer failed: " + " | ".join(tail))
 
 
-def produced_mp3(topic: dict, since: float) -> str:
-    """Name the episode the producer just wrote.
-
-    The producer derives its own slug and date from the script filename, so
-    reading the directory beats predicting the name (and survives a run that
-    crosses midnight). The computed name is only the fallback.
-    """
-    eps = PODCASTS / "public" / "episodes"
-    fresh = [p for p in eps.glob("special-edition-*.mp3")
-             if p.stat().st_mtime >= since - 5]
-    if fresh:
-        return max(fresh, key=lambda p: p.stat().st_mtime).name
-    return f"special-edition-{topic['slug']}-{datetime.now():%Y-%m-%d}.mp3"
+def produced_mp3(script_path: Path) -> str:
+    """Use the producer's filename contract, never another run's newest file."""
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})_(.+)", script_path.stem)
+    if not match:
+        raise RuntimeError(f"invalid script filename: {script_path.name}")
+    name = f"special-edition-{match[2].lower()}-{match[1]}.mp3"
+    path = PODCASTS / "public" / "episodes" / name
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"expected audio missing or empty: {name}")
+    return name
 
 
 def ensure_uploaded(mp3_name: str, attempts: int = 3) -> None:
@@ -183,14 +184,14 @@ def ensure_uploaded(mp3_name: str, attempts: int = 3) -> None:
 def verify_live(cfg: dict, title: str, minutes: int = 12) -> bool:
     """Spotify ingests asynchronously; poll the public feed for the title."""
     norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
-    want = norm(title)[:40]
+    want = norm(title)
     deadline = time.time() + minutes * 60
     while time.time() < deadline:
         try:
             req = urllib.request.Request(cfg["spotify_rss"],
                                          headers={"User-Agent": "gkdaily-special/1.0"})
             root = ET.fromstring(urllib.request.urlopen(req, timeout=25).read())
-            if any(want and want in norm(el.text or "") for el in root.iter("title")):
+            if any(want and want == norm(el.text or "") for el in root.findall("./channel/item/title")):
                 return True
         except Exception:
             pass
@@ -203,10 +204,14 @@ def verify_live(cfg: dict, title: str, minutes: int = 12) -> bool:
 def status(cfg: dict) -> int:
     scripts = cfg["drive_gk_daily"] / "scripts"
     pending = [p.name for p in scripts.glob("*.md")] if scripts.is_dir() else []
-    led = json.loads((PODCASTS / "config/spotify_uploaded.json").read_text())
+    ledger_path = PODCASTS / "config/spotify_uploaded.json"
+    led = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
     today = datetime.now(ZoneInfo(cfg["timezone"])).strftime("%Y-%m-%d")
     todays = [n for n, ts in led.items() if ts.startswith(today)]
     running = LOCK.exists() and _locked()
+    with jobs.connect() as conn:
+        for job in conn.execute("SELECT id,status,attempts FROM jobs WHERE status != 'done' ORDER BY created"):
+            print(f"job {job['id'][:8]}: {job['status']} (attempts {job['attempts']})")
     print(f"in flight        : {'yes' if running else 'no'}")
     print(f"scripts waiting  : {', '.join(pending) or 'none'}")
     print(f"published today  : {', '.join(todays) or 'none'}")
@@ -238,28 +243,32 @@ def main() -> int:
     g.add_argument("--next", action="store_true",
                    help="produce the top uncovered topic from the topics doc")
     g.add_argument("--status", action="store_true")
+    g.add_argument("--job-id", help=argparse.SUPPRESS)
     ap.add_argument("--quiet", action="store_true", help="no Telegram messages")
     ap.add_argument("--detach", action="store_true",
                     help="run in a new session, surviving the caller's exit")
     args = ap.parse_args()
 
-    # MiniBot launches this with nohup, but a nohup'd child stays in the
-    # caller's PROCESS GROUP — and `launchctl kickstart -k` SIGKILLs the whole
-    # group. Restarting MiniBot therefore killed a running episode outright
-    # (2026-08-29: the Cascadia run died mid-research, 2 minutes in, with no
-    # error anywhere). setsid() puts the run in its own session so nothing
-    # aimed at MiniBot can reach it.
-    if args.detach:
-        if os.fork() > 0:
-            return 0
-        os.setsid()
     QUIET = args.quiet
     cfg = tower.load_config()
+    saved = {}
+    if args.job_id:
+        job = jobs.get(args.job_id)
+        request = json.loads(job['request'])
+        args.topic = request['topic']
+        QUIET = request['quiet']
+        saved = json.loads(job['checkpoint'])
+    if args.detach and not args.status:
+        ident = jobs.enqueue(args.topic, args.quiet)
+        print(f"Queued GK Daily job {ident}; Tower will process it and report progress.", flush=True)
+        jobs.maybe_start(cfg)
+        return 0
 
     if args.status:
         return status(cfg)
 
-    lock_file = open(LOCK, "w")
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(LOCK, "a")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -269,8 +278,10 @@ def main() -> int:
 
     started = datetime.now(ZoneInfo(cfg["timezone"]))
     try:
-        topic = resolve_topic(cfg, args.topic)
-    except SystemExit as exc:
+        topic = saved.get("topic") or resolve_topic(cfg, args.topic)
+        if args.job_id:
+            jobs.checkpoint(args.job_id, topic=topic)
+    except (SystemExit, RuntimeError) as exc:
         say(f"🎙️ Can't start: {exc}")
         return 3
     say(f"🎙️ GK Daily special starting — {topic['line'][:110]}\n"
@@ -278,13 +289,43 @@ def main() -> int:
         "about 12–15 minutes until it is live on Spotify.")
 
     try:
-        script_path = write_script(cfg, topic)
+        if args.job_id:
+            # Archive before exposing to Drive. A retry uses this exact file,
+            # including its original date, even if the producer moved its copy.
+            archive = TOWER / 'job-scripts' / args.job_id
+            archive.mkdir(parents=True, exist_ok=True)
+            if not saved.get('script'):
+                script_path = archive / f"{started:%Y-%m-%d}_{topic['slug']}.md"
+                jobs.checkpoint(args.job_id, script=str(script_path))
+            else:
+                script_path = Path(saved['script'])
+            if not script_path.exists():
+                script = factory.generate(cfg, topic)
+                tmp = script_path.with_suffix('.tmp')
+                tmp.write_text(script)
+                tmp.replace(script_path)
+        else:
+            script_path = write_script(cfg, topic)
         words = len(script_path.read_text().split())
         say(f"✍️ Script written ({words} words). Rendering audio…")
 
         render_start = time.time()
-        produce(script_path)
-        mp3 = produced_mp3(topic, render_start)
+        if args.job_id:
+            # Producer archives/moves its input, so retain our canonical copy.
+            import shutil
+            delivery = cfg['drive_gk_daily'] / 'scripts' / script_path.name
+            try:
+                mp3 = produced_mp3(script_path)
+            except RuntimeError:
+                if not delivery.exists():
+                    temp = delivery.with_suffix('.md.tmp')
+                    shutil.copyfile(script_path, temp)
+                    temp.replace(delivery)
+                produce(delivery)
+            mp3 = produced_mp3(script_path)
+        else:
+            produce(script_path)
+            mp3 = produced_mp3(script_path)
         meta_path = PODCASTS / "public/episodes/special_editions.json"
         title = topic["line"][:60]
         try:
@@ -305,7 +346,7 @@ def main() -> int:
         say(f"⚠️ {title} uploaded but not visible in the feed yet. "
             "Spotify is still ingesting; it normally appears within the hour "
             "and the Tower is watching it.")
-        return 0
+        return 4  # awaiting verification is not verified success
     except Exception as exc:
         say(f"❌ GK Daily special FAILED: {str(exc)[:300]}\n"
             f"Topic: {topic['line'][:80]}")

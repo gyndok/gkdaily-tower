@@ -39,6 +39,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from reliability import atomic_json
+
 import tower  # load_config / telegram / load_env_creds; tower imports us lazily
 
 log = logging.getLogger("tower.scout")
@@ -267,8 +269,8 @@ def load_queue(cfg: dict) -> dict:
     if p.exists():
         try:
             return json.loads(p.read_text())
-        except Exception:
-            log.warning("queue.json unreadable; starting fresh")
+        except Exception as exc:
+            raise RuntimeError("queue.json unreadable; preserving it for recovery") from exc
     return {"updated": None, "candidates": []}
 
 
@@ -276,9 +278,7 @@ def save_queue(cfg: dict, queue: dict) -> None:
     queue["updated"] = _now(cfg).isoformat(timespec="seconds")
     p = cfg["topic_queue_json"]
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(queue, indent=2, ensure_ascii=False) + "\n")
-    tmp.replace(p)
+    atomic_json(p, queue)
 
 
 def _now(cfg: dict) -> datetime:

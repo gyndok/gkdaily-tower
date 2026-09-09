@@ -1,0 +1,95 @@
+--- /Users/geffreyklein/podcasts/scripts/upload_spotify.py
++++ /Users/geffreyklein/podcasts/scripts/upload_spotify.py
+@@ -141,7 +141,18 @@
+ 
+ 
+ def save_state(state: dict) -> None:
+-    STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
++    import os
++    import tempfile
++    fd, temp = tempfile.mkstemp(prefix=".spotify-ledger-", dir=STATE_PATH.parent)
++    try:
++        with os.fdopen(fd, "w") as stream:
++            stream.write(json.dumps(state, indent=2) + "\n")
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temp, STATE_PATH)
++    finally:
++        if os.path.exists(temp):
++            os.unlink(temp)
+ 
+ 
+ def pending_episodes(state: dict) -> list[Path]:
+@@ -288,6 +299,11 @@
+         shot(page, f"dryrun_{mp3.stem}")
+         log.info("dry-run: stopped at the enabled Publish button for %s", mp3.name)
+         return
++    # Persist uncertainty BEFORE the external side effect. A timeout or crash
++    # after clicking must never cause an automatic second publication.
++    state = load_state()
++    state[mp3.name] = datetime.now().isoformat(timespec="seconds") + " UNVERIFIED"
++    save_state(state)
+     publish_btn.click()
+ 
+     # 5. Confirm it landed: wizard navigates away / success state appears.
+@@ -349,6 +365,18 @@
+     logging.basicConfig(level=logging.INFO,
+                         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+ 
++    # Single-instance lock: the producer's upload stage and a manual run can
++    # otherwise race (both read the ledger before either publishes) and
++    # double-publish an episode — it happened on 2026-08-14.
++    import fcntl
++    lock_file = open(BASE_DIR / ".spotify-upload.lock", "w")
++    try:
++        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except BlockingIOError:
++        log.info("Another upload run is in progress — exiting; it will handle "
++                 "everything pending.")
++        return 0
++
+     state = load_state()
+     pending = pending_episodes(state)
+ 
+@@ -364,18 +392,6 @@
+         for p in pending:
+             print(f"pending: {p.name} — {episode_metadata(p)['title']}")
+         print(f"{len(pending)} pending, {len(state)} already uploaded")
+-        return 0
+-
+-    # Single-instance lock: the producer's upload stage and a manual run can
+-    # otherwise race (both read the ledger before either publishes) and
+-    # double-publish an episode — it happened on 2026-08-14.
+-    import fcntl
+-    lock_file = open(BASE_DIR / ".spotify-upload.lock", "w")
+-    try:
+-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+-    except BlockingIOError:
+-        log.info("Another upload run is in progress — exiting; it will handle "
+-                 "everything pending.")
+         return 0
+ 
+     from playwright.sync_api import sync_playwright
+@@ -417,7 +433,7 @@
+         return 2
+ 
+     with sync_playwright() as pw:
+-        browser, ctx = launch_with_session(pw, headed=True)
++        browser, ctx = launch_with_session(pw, headed=False)
+         page = ctx.new_page()
+         try:
+             if not logged_in(page):
+@@ -449,10 +465,12 @@
+                     # unverified one is tagged and alerted so it cannot pass
+                     # silently the way the 2026-08-29 phantom did.
+                     stamp = datetime.now().isoformat(timespec="seconds")
+-                    state[mp3.name] = stamp
++                    state[mp3.name] = stamp + " UNVERIFIED"
+                     save_state(state)
+                     title = episode_metadata(mp3)["title"]
+                     if verify_published(page, title):
++                        state[mp3.name] = stamp
++                        save_state(state)
+                         log.info("verified in Creators: %s", mp3.name)
+                     else:
+                         state[mp3.name] = stamp + " UNVERIFIED"

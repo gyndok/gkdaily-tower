@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 state.db
 staging/
+
+# Local runtime state and generated scripts
+jobs.db*
+.jobs.lock
+job-scripts/

@@ -1,0 +1,16 @@
+--- /Users/geffreyklein/clawd/produce-special-podcast.py
++++ /Users/geffreyklein/clawd/produce-special-podcast.py
+@@ -676,6 +676,13 @@
+                     help="re-produce even if the public mp3 already exists")
+     args = ap.parse_args()
+ 
++    # Serialize all entry points, including launchd, Tower and Telegram.
++    import fcntl
++    producer_lock = open(PODCAST_ROOT / ".special-producer.lock", "a")
++    fcntl.flock(producer_lock, fcntl.LOCK_EX)
++    if args.script and not args.script.exists():
++        if (args.script.parent / "processed" / args.script.name).exists():
++            return 0  # a preceding lock holder completed this exact input
+     scripts = [args.script] if args.script else find_new_scripts()
+     if not scripts:
+         return 0  # nothing new: exit silently, no log noise

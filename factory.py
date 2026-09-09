@@ -204,7 +204,7 @@ def _generate_via_kimi(cfg: dict, topic: dict, user_prompt: str) -> str:
                 reply = json.loads(resp.read())
             choice = reply["choices"][0]
             if choice.get("finish_reason") == "length":
-                log.warning("kimi output truncated (finish_reason=length)")
+                raise RuntimeError("Kimi script truncated; refusing publication")
             text = choice["message"].get("content") or ""
             if text.strip():
                 log.info("script generated via kimi fallback (%s)", model)
@@ -252,6 +252,8 @@ def generate(cfg: dict, topic: dict) -> str:
     try:
         return _finalize(_generate_via_claude(cfg, user_prompt), "claude")
     except Exception as exc:
+        if not cfg["factory"].get("allow_unresearched_fallback", False):
+            raise RuntimeError("Live research unavailable; script held instead of publishing unresearched content") from exc
         log.warning("claude generation failed (%s) — falling back to kimi", exc)
         try:
             tower.telegram(cfg, "⚠️ GK Daily: Claude unavailable for the script "
@@ -319,12 +321,13 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
                  "cache_read=%s, cache_write=%s, web_searches=%s", round_no,
                  response.stop_reason, u.input_tokens, u.output_tokens, cr, cw,
                  searches)
+        if response.stop_reason == "max_tokens":
+            raise RuntimeError("Claude script truncated; refusing publication")
         if response.stop_reason == "refusal":
             raise RuntimeError("model declined the request (stop_reason=refusal)")
         if response.stop_reason != "pause_turn":
             break
-        messages = [user_msg,
-                    {"role": "assistant", "content": response.content}]
+        messages.append({"role": "assistant", "content": response.content})
     else:
         raise RuntimeError("generation did not finish within 8 pause_turn rounds")
 
