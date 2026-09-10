@@ -171,8 +171,14 @@ class Collectors:
         pending = []
         if scripts.is_dir():
             for p in scripts.glob("*.md"):
-                age_min = (time.time() - p.stat().st_mtime) / 60
-                pending.append({"name": p.name, "age_minutes": round(age_min)})
+                st = p.stat()
+                age_min = (time.time() - st.st_mtime) / 60
+                # A placeholder Drive will not hydrate looks identical to a
+                # script the producer merely has not reached yet. Recording it
+                # turns "stuck for 14 h" into "stuck because Drive is wedged"
+                # (2026-09-10) — a different fix entirely.
+                pending.append({"name": p.name, "age_minutes": round(age_min),
+                                "cloud_only": st.st_size > 0 and st.st_blocks == 0})
         processed_today = (
             sorted(p.name for p in processed.glob(f"{today}_*.md"))
             if processed.is_dir() else [])
@@ -520,8 +526,10 @@ def evaluate(cfg: dict, col: Collectors, data: dict, now: datetime) -> list:
     add("no_stuck_scripts", "No scripts stuck unprocessed",
         None if "error" in sp else not stuck,
         now if stuck else None,
-        detail="; ".join(f"{p['name']} ({p['age_minutes']} min)"
-                         for p in stuck) or "clear")
+        detail="; ".join(
+            f"{p['name']} ({p['age_minutes']} min"
+            + (", Drive placeholder not hydrating" if p.get("cloud_only") else "")
+            + ")" for p in stuck) or "clear")
 
     # 4b. every rendered episode reaches the ledger — the uploader's failure
     #     is non-fatal to the producer, so a rendered-but-never-uploaded
