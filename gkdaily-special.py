@@ -114,7 +114,9 @@ def say(msg: str, telegram: bool = True) -> None:
 
 
 def run(cmd: list, timeout: int) -> subprocess.CompletedProcess:
-    return subprocess.run([str(c) for c in cmd], capture_output=True,
+    sys.path.insert(0, str(PODCASTS / "scripts"))
+    from runtime import run_managed
+    return run_managed([str(c) for c in cmd], capture_output=True,
                           text=True, timeout=timeout)
 
 
@@ -142,7 +144,7 @@ def write_script(cfg: dict, topic: dict) -> Path:
 def produce(script_path: Path) -> None:
     """Call the producer directly — never wait on the WatchPaths trigger."""
     proc = run([CLAWD / ".venv/bin/python3", CLAWD / "produce-special-podcast.py",
-                "--script", script_path], timeout=2700)
+                "--script", script_path], timeout=7200)
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
         raise RuntimeError("producer failed: " + " | ".join(tail))
@@ -155,7 +157,9 @@ def produced_mp3(script_path: Path) -> str:
         raise RuntimeError(f"invalid script filename: {script_path.name}")
     name = f"special-edition-{match[2].lower()}-{match[1]}.mp3"
     path = PODCASTS / "public" / "episodes" / name
-    if not path.is_file() or path.stat().st_size == 0:
+    ledger = PODCASTS / "config/spotify_uploaded.json"
+    recorded = name in json.loads(ledger.read_text()) if ledger.exists() else False
+    if not recorded and (not path.is_file() or path.stat().st_size == 0):
         raise RuntimeError(f"expected audio missing or empty: {name}")
     return name
 
@@ -170,7 +174,9 @@ def ensure_uploaded(mp3_name: str, attempts: int = 3) -> None:
         except Exception:
             pass
         say(f"Spotify upload not recorded yet — retry {i}/{attempts}")
-        run(["/opt/homebrew/bin/python3", PODCASTS / "scripts/upload_spotify.py"],
+        sys.path.insert(0, str(PODCASTS / "scripts"))
+        from runtime import uploader_python
+        run([uploader_python(PODCASTS), PODCASTS / "scripts/upload_spotify.py"],
             timeout=1800)
         time.sleep(5)
     try:
@@ -214,7 +220,11 @@ def status(cfg: dict) -> int:
             print(f"job {job['id'][:8]}: {job['status']} (attempts {job['attempts']})")
     print(f"in flight        : {'yes' if running else 'no'}")
     print(f"scripts waiting  : {', '.join(pending) or 'none'}")
-    print(f"published today  : {', '.join(todays) or 'none'}")
+    print(f"uploads recorded : {', '.join(todays) or 'none'} (not delivery proof)")
+    delivery_path = PODCASTS / "config/delivery.json"
+    records = json.loads(delivery_path.read_text()) if delivery_path.exists() else {}
+    verified = [name for name in todays if records.get(name, {}).get('state') == 'verified_live']
+    print(f"verified live    : {', '.join(verified) or 'none recorded here'}")
     try:
         upcoming = [l for l in scout.gdoc_lines(cfg)
                     if not factory.is_covered(l, factory.covered_topics(cfg))]
@@ -249,16 +259,16 @@ def main() -> int:
                     help="run in a new session, surviving the caller's exit")
     args = ap.parse_args()
 
-    QUIET = args.quiet
+    QUIET = args.quiet or os.getenv("GK_QUIET") == "1"
     cfg = tower.load_config()
     saved = {}
     if args.job_id:
         job = jobs.get(args.job_id)
         request = json.loads(job['request'])
         args.topic = request['topic']
-        QUIET = request['quiet']
+        QUIET = request['quiet'] or os.getenv("GK_QUIET") == "1"
         saved = json.loads(job['checkpoint'])
-    if args.detach and not args.status:
+    if not args.job_id and not args.status:
         ident = jobs.enqueue(args.topic, args.quiet)
         print(f"Queued GK Daily job {ident}; Tower will process it and report progress.", flush=True)
         jobs.maybe_start(cfg)
@@ -290,6 +300,8 @@ def main() -> int:
 
     try:
         if args.job_id:
+            jobs.checkpoint(args.job_id, stage="Researching and writing")
+        if args.job_id:
             # Archive before exposing to Drive. A retry uses this exact file,
             # including its original date, even if the producer moved its copy.
             archive = TOWER / 'job-scripts' / args.job_id
@@ -309,19 +321,16 @@ def main() -> int:
         words = len(script_path.read_text().split())
         say(f"✍️ Script written ({words} words). Rendering audio…")
 
+        if args.job_id:
+            jobs.checkpoint(args.job_id, stage="Making audio and preparing upload")
         render_start = time.time()
         if args.job_id:
             # Producer archives/moves its input, so retain our canonical copy.
             import shutil
-            delivery = cfg['drive_gk_daily'] / 'scripts' / script_path.name
             try:
                 mp3 = produced_mp3(script_path)
             except RuntimeError:
-                if not delivery.exists():
-                    temp = delivery.with_suffix('.md.tmp')
-                    shutil.copyfile(script_path, temp)
-                    temp.replace(delivery)
-                produce(delivery)
+                produce(script_path)
             mp3 = produced_mp3(script_path)
         else:
             produce(script_path)
@@ -332,12 +341,18 @@ def main() -> int:
             title = json.loads(meta_path.read_text())[mp3]["title"]
         except Exception:
             pass
+        if args.job_id:
+            jobs.checkpoint(args.job_id, episode=mp3, title=title)
         say(f"🎧 Rendered: {title}")
 
+        if args.job_id:
+            jobs.checkpoint(args.job_id, stage="Uploading to Spotify")
         ensure_uploaded(mp3)
         say("⬆️ Uploaded to Spotify — waiting for it to appear in the feed…",
             telegram=False)
 
+        if args.job_id:
+            jobs.checkpoint(args.job_id, stage="Waiting for Spotify confirmation")
         if verify_live(cfg, title):
             mins = (datetime.now(ZoneInfo(cfg["timezone"])) - started).seconds // 60
             say(f"✅ LIVE on Spotify ({mins} min): {title}\n"

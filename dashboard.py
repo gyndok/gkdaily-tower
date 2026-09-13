@@ -17,6 +17,7 @@ never pass through here — re-login stays a terminal job by design.
 """
 
 import html
+import api
 import secrets
 import json
 import logging
@@ -103,6 +104,21 @@ def _mark_processed(script: Path) -> str:
 
 def dispatch(name: str, arg: str, form: dict | None = None) -> str:
     """Start (or run) one whitelisted action; returns a short ack string."""
+    if name == "produce_special":
+        topic = " ".join((arg or "").split())
+        if not topic or len(topic) > 1000:
+            return _record(name, arg, "failed", "Enter a topic between 1 and 1,000 characters.")
+        import jobs
+        try:
+            ident = jobs.enqueue(topic)
+        except Exception:
+            log.exception("could not queue special edition")
+            return _record(name, topic, "failed", "Could not save your request. Please try again.")
+        try:
+            jobs.maybe_start(CFG)
+        except Exception:
+            log.exception("worker start delayed; Tower will retry")
+        return _record(name, topic, "queued", f"Saved request {ident[:8]}. Progress appears above.")
     if name == "add_topic":
         line = " ".join((arg or "").split())[:200]
         if len(line) < 8:
@@ -136,7 +152,10 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
                 str(clawd / "produce-special-podcast.py")]
 
     if name == "retry_upload":
-        return _spawn(name, arg, uploader, 1800)
+        import jobs
+        names = pending_uploads()
+        for episode in names: jobs.enqueue_upload(episode)
+        return _record(name, arg, "queued", f"Saved {len(names)} upload retries")
     if name == "retry_substack":
         return _spawn(name, arg,
                       ["/opt/homebrew/bin/python3",
@@ -185,19 +204,9 @@ def dispatch(name: str, arg: str, form: dict | None = None) -> str:
             # pages, double-clicks on covered topics, and arbitrary input.
             return _record(name, arg, "failed",
                            "not an uncovered line in the current queue")
-        conn = sqlite3.connect(DB_PATH)
-        busy = conn.execute(
-            "SELECT COUNT(*) FROM actions WHERE status='running' "
-            "AND name IN ('produce_topic','run_factory_staged')").fetchone()[0]
-        conn.close()
-        if busy:
-            return _record(name, arg, "failed",
-                           "a script generation is already running — wait for it")
-        _mark_upcoming_stale()  # the line is about to become covered
-        return _spawn(name, arg,
-                      [str(Path(CFG["factory"]["python"]).expanduser()),
-                       str(Path(__file__).resolve().parent / "factory.py"),
-                       "--run", "--topic", arg], 1800)
+        import jobs
+        ident = jobs.enqueue(arg)
+        return _record(name, arg, "queued", f"Saved request {ident[:8]}")
     if name in ("approve_topic", "veto_topic"):
         import scout
         try:
@@ -450,6 +459,32 @@ def recent_actions(limit: int = 10) -> list[tuple]:
     return rows
 
 
+def special_requests_html() -> str:
+    import jobs
+    labels = {"queued": "Queued", "running": "In progress", "retry": "Waiting to retry",
+              "needs_attention": "Needs attention", "done": "Live on Spotify"}
+    try:
+        with jobs.connect() as conn:
+            rows = conn.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT 10").fetchall()
+        out = []
+        for row in rows:
+            request = json.loads(row["request"])
+            checkpoint = json.loads(row["checkpoint"])
+            topic = request.get("topic") or "Next topic from the queue"
+            detail = labels.get(row["status"], row["status"])
+            if row["status"] == "running":
+                detail = checkpoint.get("stage") or detail
+            if row["status"] == "done":
+                detail = '<a href="https://open.spotify.com/show/0344TpzH4nfACvR7amNX7V">Live on Spotify ↗</a>'
+            else:
+                detail = esc(detail)
+            out.append(f'<tr><td>{esc(topic)}<br><small>Request {esc(row["id"][:8])}</small></td><td>{detail}</td></tr>')
+        return ''.join(out) or '<tr><td colspan="2" class="muted">Your requests will appear here.</td></tr>'
+    except Exception:
+        log.exception("could not read special requests")
+        return '<tr><td>Request status temporarily unavailable. Refresh to try again.</td></tr>'
+
+
 # ------------------------------------------------------------------- html --
 
 CSS = """
@@ -604,10 +639,33 @@ def render_page() -> str:
 
     return f"""<!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="120">
+<script>
+// Preserve topics being typed, including when Safari moves focus away.
+let editing = false;
+document.addEventListener('input', () => {{ editing = true; }});
+setInterval(() => {{ if (!editing) location.reload(); }}, 30000);
+</script>
 <title>GK Daily Tower</title><style>{CSS}</style>
 <h1>GK Daily Control Tower <small>P2</small></h1>
 <div class="banner {overall}">{labels.get(overall, "?")} — checked {esc(status.get("ts", "never"))}</div>
+
+<section id="special-edition">
+<h2>Make a special edition</h2>
+<p>Enter a topic and we’ll research it, write the script, make the audio, and publish it to Spotify.</p>
+<form method="post" action="action" style="display:block;margin:0">
+<input type="hidden" name="csrf" value="{CSRF_TOKEN}">
+<input type="hidden" name="name" value="produce_special">
+<label for="special-topic">What should this episode cover?</label>
+<input id="special-topic" name="arg" type="text" maxlength="1000" required
+ placeholder="e.g. How undersea cables keep the internet connected"
+ style="display:block;box-sizing:border-box;width:100%;margin:.5rem 0;font-size:16px"
+ enterkeyhint="go">
+<button type="submit">Create &amp; publish episode</button>
+</form>
+<p class="muted">Press Enter or tap the button. You can close Safari after submitting;
+production continues on the Mac. Allow about 15–30 minutes, or longer if another episode is ahead of yours.</p>
+<table><tr><th>Recent requests</th><th>Status</th></tr>{special_requests_html()}</table>
+</section>
 
 <h2>Checks</h2>
 <table><tr><th>Check</th><th>Detail</th></tr>{rule_rows}</table>
@@ -666,7 +724,7 @@ to the <a href="{esc(CFG.get("topic_queue_doc", "#"))}">GK Daily Topics doc</a>
 <h2>Recent actions</h2>
 <table><tr><th>When</th><th>Action</th><th>Status</th><th></th></tr>{act_rows}</table>
 
-<p><small>Auto-refreshes every 2 min · JSON at <a href="status">status</a>
+<p><small>Auto-refreshes every 30 seconds while you’re not editing · JSON at <a href="status">status</a>
 · re-login (never via web): <code>cd ~/podcasts && python3 scripts/upload_spotify.py --login</code></small></p>
 """
 
@@ -689,6 +747,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/tower/"):
+            self._send(b'', 'text/plain', 302, {'Location':'ui/'}); return
+        if path.endswith("/api/state"):
+            try: self._send(json.dumps(api.snapshot(__import__(__name__))).encode(), "application/json")
+            except Exception:
+                log.exception("API snapshot failed")
+                self._send(b'{"error":"Status is temporarily unavailable"}', "application/json", 503)
+            return
+        if path.endswith("/api/topics"):
+            try:
+                lines, covered = upcoming_topics()
+                body = {"topics":lines,"covered":covered,"error":_UPCOMING_ERROR}
+                self._send(json.dumps(body).encode(), "application/json")
+            except Exception as exc: self._send(json.dumps({"error":str(exc),"topics":[]}).encode(), "application/json", 503)
+            return
+        if "/ui/" in path:
+            name = path.rsplit("/",1)[-1] or "index.html"
+            if name not in ("index.html","app.js","app.css"):
+                self._send(b'not found','text/plain',404); return
+            file = Path(__file__).parent / "ui" / name
+            self._send(file.read_bytes(), {"index.html":"text/html; charset=utf-8","app.js":"text/javascript","app.css":"text/css"}[name]); return
         if path.endswith("/status"):
             self._send(json.dumps(GET_STATUS(), indent=2).encode(),
                        "application/json")
@@ -711,6 +790,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if path.endswith("/api/action"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 16384: raise ValueError("Invalid request size")
+                self.connection.settimeout(10)
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict): raise ValueError("Expected a JSON object")
+                if not secrets.compare_digest(str(body.get("csrf", "")).encode(), CSRF_TOKEN.encode()):
+                    self._send(b'{"error":"Reload the dashboard before submitting"}', "application/json", 403); return
+                result = api.mutate(body, __import__(__name__))
+                self._send(json.dumps(result).encode(), "application/json")
+            except (ValueError, RuntimeError) as exc:
+                self._send(json.dumps({"error":str(exc)}).encode(), "application/json", 400)
+            except Exception:
+                log.exception("API action failed")
+                self._send(b'{"error":"Action could not be saved"}', "application/json", 500)
+            return
         if not path.endswith("/action"):
             self._send(b"not found", "text/plain", 404)
             return
@@ -730,7 +826,7 @@ class Handler(BaseHTTPRequestHandler):
         name = (form.get("name") or [""])[0]
         arg = (form.get("arg") or [""])[0]
         dispatch(name, arg, form)
-        self._send(b"", "text/plain", 303, {"Location": "."})
+        self._send(b"", "text/plain", 303, {"Location": "./#special-edition" if name == "produce_special" else "."})
 
     def log_message(self, fmt, *args):
         pass

@@ -264,21 +264,86 @@ def propose(cfg: dict, headlines: dict, past: list, queued: list) -> list[dict]:
 
 # ------------------------------------------------------------------- queue --
 
+QUEUE_IO_TIMEOUT = 30   # seconds; a stalled Drive mount blocks forever otherwise
+
+
+def _mirror_path(cfg: dict) -> Path:
+    """Local mirror of the queue, on real disk rather than the Drive mount."""
+    return Path(__file__).resolve().parent / "queue.mirror.json"
+
+
+def _with_timeout(fn, seconds: int, what: str):
+    """Run fn in a daemon thread; raise TimeoutError if it outlives `seconds`.
+
+    Reads and writes under ~/Library/CloudStorage block indefinitely when
+    DriveFS cannot hydrate a placeholder (e.g. its content cache is disabled
+    because the disk is full), so every queue touch is bounded here.
+    """
+    box = {}
+
+    def run():
+        try:
+            box["ok"] = fn()
+        except BaseException as exc:      # noqa: BLE001 - reported to caller
+            box["err"] = exc
+
+    t = threading.Thread(target=run, daemon=True, name=f"queue-io:{what}")
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise TimeoutError(f"{what} blocked for >{seconds}s (Drive mount stalled)")
+    if "err" in box:
+        raise box["err"]
+    return box["ok"]
+
+
 def load_queue(cfg: dict) -> dict:
     p = cfg["topic_queue_json"]
-    if p.exists():
+    mirror = _mirror_path(cfg)
+    try:
+        drive = _with_timeout(
+            lambda: json.loads(p.read_text()) if p.exists() else None,
+            QUEUE_IO_TIMEOUT, "read queue.json")
+    except Exception as exc:
+        log.warning("queue.json unreadable on Drive (%s); trying local mirror", exc)
+    else:
+        if drive is not None:
+            try:                          # keep the mirror fresh for next time
+                atomic_json(mirror, drive)
+            except Exception as exc:
+                log.warning("could not refresh queue mirror: %s", exc)
+            return drive
+        if not mirror.exists():
+            return {"updated": None, "candidates": []}
+
+    if mirror.exists():
         try:
-            return json.loads(p.read_text())
+            queue = json.loads(mirror.read_text())
         except Exception as exc:
-            raise RuntimeError("queue.json unreadable; preserving it for recovery") from exc
-    return {"updated": None, "candidates": []}
+            raise RuntimeError(
+                f"queue.json unreadable and mirror {mirror} is corrupt; "
+                "preserving both for recovery") from exc
+        log.warning("running off local mirror %s (updated %s) — Drive copy "
+                    "could not be read", mirror, queue.get("updated"))
+        return queue
+
+    raise RuntimeError("queue.json unreadable and no local mirror exists; "
+                       "preserving it for recovery")
 
 
 def save_queue(cfg: dict, queue: dict) -> None:
     queue["updated"] = _now(cfg).isoformat(timespec="seconds")
+    # Local mirror first: it is the copy that cannot be lost to a stalled mount.
+    atomic_json(_mirror_path(cfg), queue)
     p = cfg["topic_queue_json"]
-    p.parent.mkdir(parents=True, exist_ok=True)
-    atomic_json(p, queue)
+    try:
+        _with_timeout(lambda: (p.parent.mkdir(parents=True, exist_ok=True),
+                               atomic_json(p, queue)),
+                      QUEUE_IO_TIMEOUT, "write queue.json")
+    except Exception as exc:
+        log.warning("could not write queue.json to Drive (%s); mirror at %s "
+                    "holds this run and will be pushed on the next good write",
+                    exc, _mirror_path(cfg))
 
 
 def _now(cfg: dict) -> datetime:

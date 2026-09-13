@@ -7,3 +7,9 @@ staging/
 jobs.db*
 .jobs.lock
 job-scripts/
+
+# Local durable mirror of the Drive queue (see scout.load_queue)
+queue.mirror.json
+
+# Local production runtime and recovery artifacts
+preflight.json

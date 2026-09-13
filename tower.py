@@ -55,6 +55,11 @@ log = logging.getLogger("tower")
 
 # ------------------------------------------------------------------ config --
 
+def upload_python(cfg):
+    path = cfg["podcasts_root"] / ".venv-upload/bin/python3"
+    return str(path) if path.exists() else "/opt/homebrew/bin/python3"
+
+
 def load_config() -> dict:
     cfg = json.loads((BASE_DIR / "config.json").read_text())
     for key in ("podcasts_root", "producer_log", "drive_gk_daily", "clawd_env",
@@ -126,12 +131,27 @@ class Collectors:
         self.now = now
         self._rss_cache: tuple[float, list] | None = None
 
+    _probes = {}
+    _probe_lock = threading.Lock()
+
     def _guard(self, fn):
-        try:
-            return fn()
-        except Exception as exc:
-            log.warning("collector %s failed: %s", fn.__name__, exc)
-            return {"error": str(exc)}
+        # A stalled Drive/FileProvider read must not stop scheduling. Keep at
+        # most one in-flight probe per collector, even across supervisor ticks.
+        name = fn.__name__
+        with self._probe_lock:
+            probe = self._probes.get(name)
+            if probe is None or probe['event'].is_set():
+                probe = {'event':threading.Event()}
+                self._probes[name] = probe
+                def run():
+                    try: probe['value'] = fn()
+                    except Exception as exc: probe['value'] = {'error':str(exc)}
+                    finally: probe['event'].set()
+                threading.Thread(target=run, daemon=True).start()
+        if not probe['event'].wait(self.cfg.get('collector_timeout_seconds', 3)):
+            log.warning('collector %s timed out; other checks continue', name)
+            return {'error':f'{name} probe timed out'}
+        return probe['value']
 
     def collect(self) -> dict:
         return {
@@ -470,11 +490,12 @@ def expected_title(mp3_name: str, special_meta: dict) -> str | None:
         slug = re.sub(r"-\d{4}-\d{2}-\d{2}$", "",
                       mp3_name[len("special-edition-"):-len(".mp3")])
         return f"GK Daily Special Edition: {slug.replace('-', ' ').title()}"
-    m = re.match(r"gk_daily_(\d{8})_morning", mp3_name)
+    m = re.match(r"gk_daily_(\d{8})_(morning|evening)", mp3_name)
     if m:
         friendly = datetime.strptime(m.group(1), "%Y%m%d").strftime(
             "%a %b %d, %Y")
-        return f"GK Daily — Morning — {friendly}"
+        label = "Morning" if m.group(2) == "morning" else "Afternoon"
+        return f"GK Daily — {label} — {friendly}"
     return None
 
 
@@ -804,152 +825,17 @@ def maybe_media_cleanup(cfg: dict, conn, now: datetime) -> None:
 # ------------------------------------------------------------- upload retry --
 
 def maybe_retry_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
-    """Re-run the Spotify uploader for an episode that rendered but never
-    reached the ledger.
+    import jobs
+    if not cfg.get('upload_retry', {}).get('enabled', True): return
+    for entry in data.get('ledger', {}).get('pending', []):
+        if entry['age_minutes'] >= cfg.get('upload_retry', {}).get('after_min', 20):
+            jobs.enqueue_upload(entry['name'])
 
-    The producer's upload stage is deliberately non-fatal, so a transient
-    Creators-SPA failure (navigation race 2026-08-22, selector timeout
-    2026-08-24) leaves a finished episode unpublished until someone notices.
-    The uploads_pending rule already sees it; this acts on it.
-    """
-    cfg_u = cfg.get("upload_retry", {})
-    if not cfg_u.get("enabled", True):
-        return
-    led = data.get("ledger", {})
-    if "error" in led:
-        return
-    stuck = [p for p in led.get("pending", [])
-             if p["age_minutes"] >= cfg_u.get("after_min", 20)]
-    if not stuck:
-        return
-    try:  # never stack uploaders — the script also holds its own flock
-        r = subprocess.run(["pgrep", "-f", "upload_spotify.py"],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            return
-    except Exception:
-        return
-    conn.execute("CREATE TABLE IF NOT EXISTS upload_retries (ts TEXT, result TEXT)")
-    last = conn.execute("SELECT MAX(ts) FROM upload_retries").fetchone()[0]
-    if last:
-        mins = (now - datetime.fromisoformat(last)).total_seconds() / 60
-        if mins < cfg_u.get("retry_min", 30):
-            return
-    ts_key = now.isoformat(timespec="seconds")
-    conn.execute("INSERT INTO upload_retries VALUES (?,?)", (ts_key, "running"))
-    conn.commit()
-    names = ", ".join(p["name"] for p in stuck)
-    log.info("retrying Spotify upload for: %s", names)
-
-    def go():
-        try:
-            proc = subprocess.run(
-                ["/opt/homebrew/bin/python3",
-                 str(cfg["podcasts_root"] / "scripts" / "upload_spotify.py")],
-                capture_output=True, text=True, timeout=1800)
-            result = ("ok" if proc.returncode == 0
-                      else f"rc={proc.returncode}: {(proc.stderr or '').strip()[-200:]}")
-        except Exception as exc:
-            result = f"failed: {exc}"
-        c = sqlite3.connect(DB_PATH)
-        c.execute("UPDATE upload_retries SET result=? WHERE ts=?", (result, ts_key))
-        c.commit(); c.close()
-        log.info("upload retry: %s", result)
-        if result.startswith("ok"):
-            telegram(cfg, f"⬆️ GK Daily: auto-retried the Spotify upload for "
-                          f"{names} — it had rendered but never uploaded.")
-        else:
-            telegram(cfg, f"❌ GK Daily: auto-retry of the Spotify upload for "
-                          f"{names} failed — {result[:180]}")
-
-    threading.Thread(target=go, daemon=True).start()
-
-
-# ------------------------------------------------------------ producer nudge --
 
 def maybe_nudge_producer(cfg: dict, conn, now: datetime, data: dict) -> None:
-    """Run the producer for a script it never picked up.
+    # Intake is durable and deduplicated in tick; never spawn a competing producer.
+    return
 
-    The producer fires on a launchd WatchPaths trigger with a 300 s throttle,
-    so a script landing just after a run (or during the window) can sit
-    untouched until the next trigger — which may be the next weekday. Seen
-    2026-08-26: the Mars script arrived the same minute the previous episode
-    finished and waited for a manual run.
-    """
-    cfg_n = cfg.get("producer_nudge", {})
-    if not cfg_n.get("enabled", True):
-        return
-    sp = data.get("special", {})
-    if "error" in sp:
-        return
-    stale = [p for p in sp.get("pending", [])
-             if p["age_minutes"] >= cfg_n.get("after_min", 8)]
-    # Never re-run a script the producer has already rejected repeatedly. A
-    # malformed or duplicate script fails identically every time, so nudging
-    # it turns a dormant leftover into a Telegram alert every retry_min,
-    # forever. Seen 2026-08-29: 2026-08-27_aging-us-power-grid.md, a titleless
-    # duplicate of an episode already published under a slightly different
-    # slug, retried until it was moved to scripts/rejected/.
-    give_up = cfg_n.get("give_up_after", 3)
-    if stale:
-        try:
-            log_text = cfg["producer_log"].read_text(errors="replace")
-        except Exception:
-            log_text = ""
-        kept = []
-        for item in stale:
-            if log_text.count(f"FAILED {item['name']}") >= give_up:
-                log.warning("not nudging %s — producer rejected it %d+ times; "
-                            "it needs a human, not another retry",
-                            item["name"], give_up)
-            else:
-                kept.append(item)
-        stale = kept
-    if not stale:
-        return
-    # Never start a second producer on top of a running one.
-    try:
-        running = subprocess.run(["pgrep", "-f", "produce-special-podcast.py"],
-                                 capture_output=True, text=True, timeout=10)
-        if running.returncode == 0 and running.stdout.strip():
-            return
-    except Exception:
-        return
-    conn.execute("CREATE TABLE IF NOT EXISTS producer_nudges (ts TEXT, result TEXT)")
-    last = conn.execute("SELECT MAX(ts) FROM producer_nudges").fetchone()[0]
-    if last:
-        mins = (now - datetime.fromisoformat(last)).total_seconds() / 60
-        if mins < cfg_n.get("retry_min", 20):
-            return
-    ts_key = now.isoformat(timespec="seconds")
-    conn.execute("INSERT INTO producer_nudges VALUES (?,?)", (ts_key, "running"))
-    conn.commit()
-    names = ", ".join(p["name"] for p in stale)
-    log.info("nudging producer for unprocessed script(s): %s", names)
-
-    def go():
-        clawd = Path.home() / "clawd"
-        try:
-            proc = subprocess.run(
-                [str(clawd / ".venv" / "bin" / "python3"),
-                 str(clawd / "produce-special-podcast.py")],
-                capture_output=True, text=True, timeout=2400)
-            result = ("ok" if proc.returncode == 0
-                      else f"rc={proc.returncode}: {(proc.stderr or '').strip()[-200:]}")
-        except Exception as exc:
-            result = f"failed: {exc}"
-        c = sqlite3.connect(DB_PATH)
-        c.execute("UPDATE producer_nudges SET result=? WHERE ts=?", (result, ts_key))
-        c.commit(); c.close()
-        log.info("producer nudge: %s", result)
-        if not result.startswith("ok"):
-            telegram(cfg, f"⚠️ GK Daily: auto-run of the producer for {names} "
-                          f"failed — {result[:200]}")
-
-    threading.Thread(target=go, daemon=True).start()
-
-
-# ---------------------------------------------------------- substack runner --
 
 def maybe_substack_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
     """Push new specials to Substack automatically: wait delay_min after the
@@ -987,7 +873,7 @@ def maybe_substack_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
     def go():
         try:
             proc = subprocess.run(
-                ["/opt/homebrew/bin/python3",
+                [upload_python(cfg),
                  str(cfg["podcasts_root"] / "scripts" / "upload_substack.py")],
                 capture_output=True, text=True, timeout=1800)
             result = "ok" if proc.returncode == 0 else                 f"rc={proc.returncode}: {(proc.stderr or proc.stdout).strip()[-300:]}"
@@ -1077,7 +963,16 @@ def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
     if not quiet:
         try:
             import jobs
+            if "06:00" <= now.strftime("%H:%M") < cfg.get("daily_catchup_until", "12:00"):
+                name = f"gk_daily_{now:%Y%m%d}_morning.mp3"
+                ledger_path = cfg["podcasts_root"] / "config/spotify_uploaded.json"
+                ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+                if name not in ledger: jobs.enqueue_daily("morning", f"{now:%Y-%m-%d}")
+            for script in (cfg["drive_gk_daily"] / "scripts").glob("*.md"):
+                jobs.enqueue_script(script)
             jobs.maybe_start(cfg)
+            jobs.retry_archives(cfg)
+            jobs.maybe_preflight(cfg, now)
         except Exception:
             log.exception("job worker start failed")
 
@@ -1202,6 +1097,11 @@ def main() -> int:
     conn.close()
     if n:
         log.warning("marked %d orphaned running action(s) as interrupted", n)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute('SELECT * FROM history ORDER BY ts DESC LIMIT 1').fetchone()
+        if row: LATEST.update(json.loads(row[1]))
+    except Exception: log.exception('could not load previous status')
     threading.Thread(target=scheduler, args=(cfg,), daemon=True).start()
     server = ThreadingHTTPServer((cfg["bind"], cfg["port"]), dashboard.Handler)
     log.info("serving on %s:%s", cfg["bind"], cfg["port"])

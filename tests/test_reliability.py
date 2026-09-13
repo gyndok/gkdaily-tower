@@ -23,7 +23,7 @@ class ReliabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d)/'queue.json'
             path.write_text('{broken')
-            with self.assertRaises(RuntimeError):
+            with patch.object(scout, "_mirror_path", return_value=Path(d)/"mirror.json"), self.assertRaises(RuntimeError):
                 scout.load_queue({'topic_queue_json':path})
             self.assertEqual(path.read_text(), '{broken')
 
