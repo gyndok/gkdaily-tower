@@ -30,7 +30,7 @@ function draw(){
  let headline=live?'Ready for your ears.':queued?'Your idea is on the list.':retry?'A short pause. Progress is saved.':failed?'This episode needs a hand.':cancelled?'Request cancelled.':legacy?'An episode from your archive.':current?.active||'Getting the studio ready';
  let description=live?'Your episode is verified live. Press play whenever you’re ready.':queued?'Your request is saved. It will start when the production worker is available.':retry?'Tower will try again automatically using the work already saved.':failed?(j.error||'Open the details to see what needs attention. Your saved work is retained.'):cancelled?'This queued request will not be produced.':legacy?'This older request is marked complete; live publication evidence was not saved with it.':current?.detail||'Loading the saved request and preparing production.';
  const audio=p.audio;
- if(!waiting&&p.phase==='audio'&&audio)description=`${audio.completed} of ${audio.total} audio sections complete. ${audio.completed===audio.total?'Assembling the finished episode.':'Completed sections are saved for recovery.'}`;
+ if(!waiting&&p.phase==='audio'&&audio)description=`${audio.completed} of ${audio.total} audio sections complete. ${audio.completed===audio.total?'Assembling the finished episode.':'Narration is progressing through the script.'}`;
  const status=live?'LIVE ON SPOTIFY':queued?'QUEUED':retry?'AUTOMATIC RETRY':failed?'NEEDS ATTENTION':cancelled?'CANCELLED':legacy?'ARCHIVE':'EPISODE IN PROGRESS';
  const listen=safeLink(p.listen_url),show='https://open.spotify.com/show/0344TpzH4nfACvR7amNX7V';
  const options=jobs.map(x=>`<option value="${escape(x.id)}" ${x.id===j.id?'selected':''}>${escape(x.title)}</option>`).join('');
