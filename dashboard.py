@@ -764,10 +764,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if "/ui/" in path:
             name = path.rsplit("/",1)[-1] or "index.html"
-            if name not in ("index.html","app.js","app.css"):
+            if name not in ("index.html","app.js","app.css","studio.js"):
                 self._send(b'not found','text/plain',404); return
             file = Path(__file__).parent / "ui" / name
-            self._send(file.read_bytes(), {"index.html":"text/html; charset=utf-8","app.js":"text/javascript","app.css":"text/css"}[name]); return
+            self._send(file.read_bytes(), {"index.html":"text/html; charset=utf-8","app.js":"text/javascript","studio.js":"text/javascript","app.css":"text/css"}[name]); return
         if path.endswith("/status"):
             self._send(json.dumps(GET_STATUS(), indent=2).encode(),
                        "application/json")

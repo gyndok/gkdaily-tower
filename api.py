@@ -3,6 +3,8 @@ import json
 import time
 from pathlib import Path
 import jobs
+from progress import describe
+import logging
 
 
 def snapshot(dashboard):
@@ -18,6 +20,7 @@ def snapshot(dashboard):
             'verified':bool(state.get('verified_at') or state.get('delivery',{}).get('verified_at')),
             'episode':state.get('episode'), 'delivery':state.get('delivery'),
             'last_error':state.get('last_error'),
+            'progress':describe(dict(row), state),
         })
     status=dashboard.GET_STATUS()
     records_path=dashboard.CFG['podcasts_root']/'config/delivery.json'
@@ -42,6 +45,8 @@ def mutate(body,dashboard):
         topic=' '.join(str(body.get('topic','')).split())
         if not 3<=len(topic)<=1000:raise ValueError('Enter a topic between 3 and 1,000 characters')
         ident=jobs.enqueue(topic)
+        try: jobs.maybe_start(dashboard.CFG)
+        except Exception: logging.getLogger(__name__).exception('Request saved; worker will start on next tick')
         return {'id':ident,'message':'Request saved. Tower will start it automatically.'}
     if action=='daily':return {'id':jobs.enqueue_daily(),'message':'Morning edition saved.'}
     if action in ('retry','cancel'):

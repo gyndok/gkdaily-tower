@@ -187,8 +187,12 @@ def ensure_uploaded(mp3_name: str, attempts: int = 3) -> None:
     raise RuntimeError(f"{mp3_name} never reached the Spotify ledger")
 
 
+LAST_VERIFIED_URL = ""
+
+
 def verify_live(cfg: dict, title: str, minutes: int = 12) -> bool:
     """Spotify ingests asynchronously; poll the public feed for the title."""
+    global LAST_VERIFIED_URL
     norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
     want = norm(title)
     deadline = time.time() + minutes * 60
@@ -197,7 +201,10 @@ def verify_live(cfg: dict, title: str, minutes: int = 12) -> bool:
             req = urllib.request.Request(cfg["spotify_rss"],
                                          headers={"User-Agent": "gkdaily-special/1.0"})
             root = ET.fromstring(urllib.request.urlopen(req, timeout=25).read())
-            if any(want and want == norm(el.text or "") for el in root.findall("./channel/item/title")):
+            item = next((item for item in root.findall("./channel/item")
+                         if want and want == norm(item.findtext("title") or "")), None)
+            if item is not None:
+                LAST_VERIFIED_URL = item.findtext("link") or ""
                 return True
         except Exception:
             pass
@@ -300,7 +307,7 @@ def main() -> int:
 
     try:
         if args.job_id:
-            jobs.checkpoint(args.job_id, stage="Researching and writing")
+            jobs.checkpoint(args.job_id, stage="Researching and writing", phase="research")
         if args.job_id:
             # Archive before exposing to Drive. A retry uses this exact file,
             # including its original date, even if the producer moved its copy.
@@ -322,7 +329,7 @@ def main() -> int:
         say(f"✍️ Script written ({words} words). Rendering audio…")
 
         if args.job_id:
-            jobs.checkpoint(args.job_id, stage="Making audio and preparing upload")
+            jobs.checkpoint(args.job_id, stage="Making audio and preparing upload", phase="audio", words=words)
         render_start = time.time()
         if args.job_id:
             # Producer archives/moves its input, so retain our canonical copy.
@@ -346,14 +353,16 @@ def main() -> int:
         say(f"🎧 Rendered: {title}")
 
         if args.job_id:
-            jobs.checkpoint(args.job_id, stage="Uploading to Spotify")
+            jobs.checkpoint(args.job_id, stage="Uploading to Spotify", phase="upload")
         ensure_uploaded(mp3)
         say("⬆️ Uploaded to Spotify — waiting for it to appear in the feed…",
             telegram=False)
 
         if args.job_id:
-            jobs.checkpoint(args.job_id, stage="Waiting for Spotify confirmation")
+            jobs.checkpoint(args.job_id, stage="Waiting for Spotify confirmation", phase="verify")
         if verify_live(cfg, title):
+            if args.job_id:
+                jobs.checkpoint(args.job_id, phase="live", listen_url=LAST_VERIFIED_URL)
             mins = (datetime.now(ZoneInfo(cfg["timezone"])) - started).seconds // 60
             say(f"✅ LIVE on Spotify ({mins} min): {title}\n"
                 "https://open.spotify.com/show/0344TpzH4nfACvR7amNX7V")

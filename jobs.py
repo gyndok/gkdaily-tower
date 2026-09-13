@@ -76,6 +76,7 @@ def checkpoint(ident, **values):
         conn.execute('BEGIN IMMEDIATE')
         row=conn.execute('SELECT checkpoint FROM jobs WHERE id=?',(ident,)).fetchone()
         state=json.loads(row[0]); state.update(values)
+        if 'stage' in values: state['stage_at']=time.time()
         conn.execute('UPDATE jobs SET checkpoint=?,updated=? WHERE id=?',(json.dumps(state),time.time(),ident))
         if 'stage' in values:
             conn.execute('INSERT INTO events(job_id,ts,kind,detail) VALUES (?,?,?,?)',(ident,time.time(),'stage',values['stage']))
@@ -108,6 +109,8 @@ def work():
             row=conn.execute("SELECT * FROM jobs WHERE status IN ('queued','retry','verifying') AND ready<=? ORDER BY created LIMIT 1",(time.time(),)).fetchone()
             if row is None:return
             conn.execute("UPDATE jobs SET status='running',updated=? WHERE id=?",(time.time(),row['id']))
+        saved=json.loads(row['checkpoint'])
+        if not saved.get('started_at'): checkpoint(row['id'],started_at=time.time())
         req=json.loads(row['request'])
         try:
             if row['status']=='verifying':
@@ -126,7 +129,7 @@ def work():
                 code=proc.returncode
                 if code not in (0,2,4):
                     checkpoint(row['id'],last_error=(proc.stderr or proc.stdout or '')[-2000:])
-            if code==0: checkpoint(row['id'],stage='verified_live',verified_at=time.time())
+            if code==0: checkpoint(row['id'],stage='verified_live',phase='live',verified_at=time.time())
             attempts=row['attempts']+(0 if code in (2,4) else 1)
             status='done' if code==0 else ('verifying' if code==4 else ('needs_attention' if attempts>=3 or code==3 else 'retry'))
             error='' if code==0 else ('Awaiting public feed confirmation' if code==4 else f'Pipeline exit {code}')
