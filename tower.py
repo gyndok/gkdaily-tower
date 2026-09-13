@@ -104,8 +104,17 @@ def telegram(cfg: dict, message: str) -> bool:
     """Send a Telegram message via the MiniBot creds. Never raises."""
     try:
         creds = load_env_creds(cfg["clawd_env"])
-        token = creds.get("TELEGRAM_BOT_TOKEN")
+        bot_env = Path(cfg.get("telegram_env", "~/minibot/.env")).expanduser()
+        mini = load_env_creds(bot_env)
+        token = mini.get("TELEGRAM_BOT_TOKEN") or creds.get("TELEGRAM_BOT_TOKEN")
         chat_id = creds.get("TELEGRAM_CHAT_ID")
+        if mini.get("TELEGRAM_BOT_TOKEN"):
+            owners = [x.strip() for x in mini.get("ALLOWED_USER_IDS", "").split(",") if x.strip()]
+            if len(owners) == 1:
+                chat_id = owners[0]
+            elif chat_id not in owners:
+                log.warning("MiniBot recipient is ambiguous; Telegram alert retained for retry")
+                return False
         if not token or not chat_id:
             log.warning("no Telegram credentials; alert not sent: %s", message)
             return False
@@ -963,6 +972,8 @@ def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
     if not quiet:
         try:
             import jobs
+            import notifications
+            notifications.maybe_poll(cfg)
             if "06:00" <= now.strftime("%H:%M") < cfg.get("daily_catchup_until", "12:00"):
                 name = f"gk_daily_{now:%Y%m%d}_morning.mp3"
                 ledger_path = cfg["podcasts_root"] / "config/spotify_uploaded.json"

@@ -112,6 +112,8 @@ def work():
         saved=json.loads(row['checkpoint'])
         if not saved.get('started_at'): checkpoint(row['id'],started_at=time.time())
         req=json.loads(row['request'])
+        import notifications
+        notifications.safe_poll(cfg)
         try:
             if row['status']=='verifying':
                 code=verify_job(dict(row),cfg)
@@ -145,9 +147,9 @@ def work():
             conn.execute('UPDATE jobs SET status=?,attempts=?,ready=?,updated=?,error=? WHERE id=?',
                          (status,attempts,time.time()+min(1800,300*2**min(attempts,3)),time.time(),error,row['id']))
             conn.execute('INSERT INTO events(job_id,ts,kind,detail) VALUES (?,?,?,?)',(row['id'],time.time(),status,error))
-        if not req.get('quiet') and status in ('done','needs_attention'):
-            title=json.loads(get(row['id'])['checkpoint']).get('title') or req.get('topic') or req.get('source') or 'Daily episode'
-            tower.telegram(cfg, f'GK Daily: {title}\n'+('Verified live on Spotify.' if status=='done' else 'Needs attention: '+error))
+        import notifications
+        notifications.safe_poll(cfg)
+
 
 
 def verify_job(row,cfg):
