@@ -3,7 +3,8 @@ import json
 import subprocess
 
 
-def edit(cfg, old, new=None, swap=None):
+def edit(cfg, old, new=None, swap=None, delete=False):
+    if delete and (new is not None or swap is not None):raise ValueError("Delete cannot be combined with an edit or swap")
     if not isinstance(old,str) or not old.strip():raise ValueError('Select a topic first')
     if new is not None:
         new=' '.join(str(new).split())
@@ -28,11 +29,12 @@ def edit(cfg, old, new=None, swap=None):
     replacements=[(first,new)] if swap is None else [(first,one(swap)[1]),(one(swap),first[1])]
     requests=[]
     for (index,text),replacement in sorted(replacements,reverse=True):
-        if replacement is None:raise ValueError('No replacement supplied')
+        if replacement is None and not delete:raise ValueError('No replacement supplied')
         end=index+len(text.encode('utf-16-le'))//2
-        requests.extend([{'deleteContentRange':{'range':{'startIndex':index,'endIndex':end}}},
-                         {'insertText':{'location':{'index':index},'text':replacement}}])
+        requests.append({'deleteContentRange':{'range':{'startIndex':index,'endIndex':end}}})
+        if not delete:
+            requests.append({'insertText':{'location':{'index':index},'text':replacement}})
     body={'writeControl':{'requiredRevisionId':revision},'requests':requests}
     result=subprocess.run(['/opt/homebrew/bin/gws','docs','documents','batchUpdate','--params',json.dumps({'documentId':doc_id}),'--json',json.dumps(body)],capture_output=True,text=True,timeout=60)
     if result.returncode:raise RuntimeError('Topic update failed or document changed. Reload before trying again.')
-    return 'Topic queue updated.'
+    return 'Topic deleted.' if delete else 'Topic queue updated.'

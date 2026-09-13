@@ -62,7 +62,7 @@ def mutate(body,dashboard):
             if not changed:raise ValueError('Job changed; refresh')
         jobs.checkpoint(ident,verification_started=time.time())
         return {'message':'Publication check queued. This does not upload another copy.'}
-    if action in ('edit_topic','swap_topic','add_topic'):
+    if action in ('edit_topic','swap_topic','add_topic','delete_topic'):
         if action=='add_topic':
             import scout
             line=' '.join(str(body.get('topic','')).split())
@@ -72,7 +72,8 @@ def mutate(body,dashboard):
             import topic_editor
             message=topic_editor.edit(dashboard.CFG,body.get('old'),
                 new=body.get('topic') if action=='edit_topic' else None,
-                swap=body.get('swap') if action=='swap_topic' else None)
+                swap=body.get('swap') if action=='swap_topic' else None,
+                delete=action=='delete_topic')
         dashboard._mark_upcoming_stale()
         return {'message':message}
     raise ValueError('Unknown action')
