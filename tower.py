@@ -898,6 +898,44 @@ def maybe_substack_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
     log.info("substack auto-upload started for %d pending special(s)", len(due))
 
 
+# ----------------------------------------------------------- stray Docs --
+
+def maybe_import_stray_docs(cfg: dict, conn, now: datetime) -> None:
+    """Import episode scripts that were saved as Google Docs, not .md files.
+
+    Seen 2026-09-13: the skill created
+    `2026-09-13_pacing-the-frontier-stepping-stone.md` as a Google Doc in My
+    Drive root. The name matched the pipeline contract exactly, so nothing
+    looked wrong — but a Doc has no readable body on disk and root is not
+    watched, so the episode never existed as far as the pipeline was
+    concerned, and no log anywhere said so. Silence is the failure mode this
+    tower exists to break.
+    """
+    cfg_d = cfg.get("docs_import", {})
+    if not cfg_d.get("enabled", True):
+        return
+    conn.execute("CREATE TABLE IF NOT EXISTS docs_sweeps (ts TEXT, found TEXT)")
+    last = conn.execute("SELECT MAX(ts) FROM docs_sweeps").fetchone()[0]
+    if last:
+        mins = (now - datetime.fromisoformat(last)).total_seconds() / 60
+        if mins < cfg_d.get("every_min", 30):
+            return
+    conn.execute("INSERT INTO docs_sweeps VALUES (?,?)",
+                 (now.isoformat(timespec="seconds"), ""))
+    conn.commit()
+
+    def go():
+        try:
+            import docs_import
+            found = docs_import.sweep(cfg)
+            if found:
+                log.info("imported stray Docs: %s", ", ".join(found))
+        except Exception:
+            log.exception("stray-Doc sweep failed")
+
+    threading.Thread(target=go, daemon=True).start()
+
+
 # --------------------------------------------------------------- main loop --
 
 LATEST: dict = {}          # last tick's full status, served by HTTP
@@ -1012,6 +1050,12 @@ def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
             maybe_nudge_producer(cfg, conn, now, data)
         except Exception:
             log.exception("producer nudge failed")
+
+    if not quiet:  # rescue scripts saved as Google Docs instead of .md files
+        try:
+            maybe_import_stray_docs(cfg, conn, now)
+        except Exception:
+            log.exception("stray-Doc import failed")
 
     if not quiet:  # substack: push new specials once Spotify has them
         try:

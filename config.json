@@ -68,5 +68,9 @@
     "after_min": 20,
     "retry_min": 30
   },
-  "unverified_grace_min": 60
+  "unverified_grace_min": 60,
+  "docs_import": {
+    "enabled": true,
+    "every_min": 30
+  }
 }
