@@ -448,8 +448,14 @@ class Collectors:
         return {"today": errors[-20:]}
 
     # -- spotify public feed (cached; separate because it's a network call) --
-    def rss_titles(self) -> list | None:
-        """Item titles from the anchor.fm feed, or None if unreachable."""
+    def rss_items(self) -> list | None:
+        """Feed items as {title, published}, or None if the feed is unreachable.
+
+        Carries the publication date because a title alone cannot identify an
+        episode: re-uploading a corrected render reuses the title, so the old
+        entry — still in the feed, or merely cached — would answer for the new
+        one. See reconcile_unverified.
+        """
         if self._rss_cache and (time.time() - self._rss_cache[0]
                                 < self.cfg["rss_cache_seconds"]):
             return self._rss_cache[1]
@@ -458,13 +464,28 @@ class Collectors:
                                          headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 root = ET.fromstring(resp.read())
-            titles = [(el.text or "").strip()
-                      for el in root.iter("title")][1:]  # [0] = channel title
-            self._rss_cache = (time.time(), titles)
-            return titles
+            from email.utils import parsedate_to_datetime  # RFC-822 pubDate
+            items = []
+            for item in root.iter("item"):
+                published = None
+                raw = (item.findtext("pubDate") or "").strip()
+                if raw:
+                    try:
+                        published = parsedate_to_datetime(raw)
+                    except (TypeError, ValueError):
+                        published = None
+                items.append({"title": (item.findtext("title") or "").strip(),
+                              "published": published})
+            self._rss_cache = (time.time(), items)
+            return items
         except Exception as exc:
             log.warning("spotify RSS fetch failed: %s", exc)
             return None
+
+    def rss_titles(self) -> list | None:
+        """Item titles only — what the live-verification rules compare against."""
+        items = self.rss_items()
+        return None if items is None else [i["title"] for i in items]
 
 
 def ledger_ts(ts: str) -> str:
@@ -954,13 +975,21 @@ def reconcile_unverified(cfg: dict, col, data: dict, now: datetime) -> None:
     The tower already polls the public feed, so it is the right place to
     settle the question: found in the feed -> drop the tag; still absent after
     unverified_grace_min -> the rule stays red and means something.
+
+    "Found" has to mean found *as this upload*, not merely a title match.
+    Re-rendering an episode and re-uploading it reuses the title, so on
+    2026-09-14 the tag for a re-uploaded rescue-dogs episode was cleared by
+    the stale feed entry for the very episode it replaced — the check
+    confirmed the wrong thing and happened to be right. The item's publication
+    date has to be at or after the upload, with a little slack for clock and
+    timezone skew between the ledger and Spotify.
     """
     led = data.get("ledger", {})
     unver = led.get("unverified", []) if "error" not in led else []
     if not unver:
         return
-    titles = col.rss_titles()
-    if titles is None:
+    items = col.rss_items()
+    if items is None:
         return
     meta_path = (cfg["podcasts_root"] / "public" / "episodes"
                  / "special_editions.json")
@@ -973,12 +1002,29 @@ def reconcile_unverified(cfg: dict, col, data: dict, now: datetime) -> None:
     try:
         with exclusive_lock(cfg["podcasts_root"] / ".spotify-upload.lock", blocking=False):
             state = json.loads(path.read_text())
+            slack = timedelta(minutes=cfg.get("unverified_date_slack_min", 30))
             for entry in unver:
                 want = expected_title(entry["name"], special_meta)
                 current = state.get(entry["name"], "")
-                if want and want in titles and current.endswith(" UNVERIFIED"):
-                    state[entry["name"]] = current.removesuffix(" UNVERIFIED")
-                    cleared.append(entry["name"])
+                if not want or not current.endswith(" UNVERIFIED"):
+                    continue
+                try:
+                    uploaded = datetime.fromisoformat(ledger_ts(current))
+                except ValueError:
+                    continue
+                if uploaded.tzinfo is None:
+                    uploaded = uploaded.replace(tzinfo=now.tzinfo)
+                match = next(
+                    (i for i in items
+                     if i["title"] == want and i["published"] is not None
+                     and i["published"] >= uploaded - slack),
+                    None)
+                if match is None:
+                    # A same-titled item published BEFORE this upload is the
+                    # episode being replaced, not proof of the new one.
+                    continue
+                state[entry["name"]] = current.removesuffix(" UNVERIFIED")
+                cleared.append(entry["name"])
             if cleared:
                 atomic_json(path, state)
     except BlockingIOError:
