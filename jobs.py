@@ -1,5 +1,6 @@
 """Durable production requests shared by launchd, Drive, Telegram and the UI."""
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -115,6 +116,7 @@ def work():
         import notifications
         notifications.safe_poll(cfg)
         try:
+            refusal=''   # set only by a refusing run; must exist on every path
             if row['status']=='verifying':
                 code=verify_job(dict(row),cfg)
             else:
@@ -131,10 +133,25 @@ def work():
                 code=proc.returncode
                 if code not in (0,2,4):
                     checkpoint(row['id'],last_error=(proc.stderr or proc.stdout or '')[-2000:])
+                # Exit 3 is a REFUSAL, not a failure: the topic is already
+                # covered, or no usable topic was given. Retrying can never
+                # change that, so the reason has to reach the dashboard —
+                # otherwise it reads as "Pipeline exit 3", indistinguishable
+                # from a transient fault. On 2026-09-21 two Starlink requests
+                # were refused (an episode existed since 09-03) and retried
+                # three times from the dashboard because the screen gave no
+                # reason to stop.
+                if code==3:
+                    m=re.search(r"Can't start: (.+)", (proc.stdout or '')+(proc.stderr or ''))
+                    refusal=m.group(1).strip() if m else ''
             if code==0: checkpoint(row['id'],stage='verified_live',phase='live',verified_at=time.time())
             attempts=row['attempts']+(0 if code in (2,4) else 1)
             status='done' if code==0 else ('verifying' if code==4 else ('needs_attention' if attempts>=3 or code==3 else 'retry'))
-            error='' if code==0 else ('Awaiting public feed confirmation' if code==4 else f'Pipeline exit {code}')
+            error=('' if code==0 else
+                   'Awaiting public feed confirmation' if code==4 else
+                   f'Refused — {refusal}' if code==3 and refusal else
+                   'Refused: no usable topic (already covered, or empty)' if code==3 else
+                   f'Pipeline exit {code}')
             if status=='verifying':
                 saved=json.loads(get(row['id'])['checkpoint'])
                 since=saved.get('verification_started') or time.time()
