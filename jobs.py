@@ -88,7 +88,14 @@ def action(ident, name):
         if name=='retry':
             sql="UPDATE jobs SET status='retry',attempts=0,ready=0,error='' WHERE id=? AND status='needs_attention'"
         elif name=='cancel':
-            sql="UPDATE jobs SET status='cancelled' WHERE id=? AND status IN ('queued','retry')"
+            # needs_attention is included deliberately. A refused job (exit 3,
+            # topic already covered) is permanent — Retry cannot help it — and
+            # without a way to dismiss it, it sits on the dashboard forever.
+            # Three had accumulated by 2026-09-21, two of them the same
+            # Starlink request retried three times because the screen offered
+            # no other action.
+            sql=("UPDATE jobs SET status='cancelled' WHERE id=? AND "
+                 "status IN ('queued','retry','needs_attention')")
         else: raise ValueError('Unknown action')
         changed=conn.execute(sql,(ident,)).rowcount
         if changed: conn.execute('INSERT INTO events(job_id,ts,kind,detail) VALUES (?,?,?,?)',(ident,time.time(),name,'Requested from dashboard'))
