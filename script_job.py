@@ -31,12 +31,27 @@ def execute(ident):
     if name not in metadata:
         jobs.checkpoint(ident,stage='Reading Drive script')
         if not local.exists():
+            # Google Drive's file provider wedges periodically while the
+            # account is perfectly healthy — a hanging read on 2026-09-10, and
+            # OSError EDEADLK "Resource deadlock avoided" on 2026-09-21, which
+            # cost the Bennu episode ten hours. The bytes stay reachable over
+            # the Drive API throughout, so a local read failure must not end
+            # the episode. produce-special-podcast.py grew this fallback on
+            # 09-10, but this module is the path that actually runs now and
+            # had its own unprotected /bin/cat.
             result=run_managed(['/bin/cat',source],timeout=180)
-            if result.returncode: raise RuntimeError('Cannot read Drive script')
-            if len(result.stdout.split())<50:
+            text=result.stdout if result.returncode==0 else None
+            if text is None:
+                jobs.checkpoint(ident,stage='Reading Drive script over the API')
+                text=producer.fetch_from_drive_api(source.name)
+            if not text:
+                raise RuntimeError('Cannot read Drive script: the local file '
+                                   'provider failed and the Drive API could '
+                                   'not supply it either')
+            if len(text.split())<50:
                 producer.quarantine(source,'Script contains fewer than 50 words')
                 return 3
-            temp=local.with_suffix('.tmp');temp.write_text(result.stdout);temp.replace(local)
+            temp=local.with_suffix('.tmp');temp.write_text(text);temp.replace(local)
         jobs.checkpoint(ident,script=str(local),stage='Rendering special edition')
         result=run_managed([Path.home()/'clawd/.venv/bin/python3',Path.home()/'clawd/produce-special-podcast.py','--script',local],timeout=7200,env={**os.environ,'GK_QUIET':'1'})
         if result.returncode: raise RuntimeError((result.stderr or '')[-1500:])
