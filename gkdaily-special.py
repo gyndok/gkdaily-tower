@@ -136,6 +136,37 @@ def resolve_topic(cfg: dict, explicit: str | None) -> dict:
     return factory.pick_topic(cfg)          # topics doc, then queue.json
 
 
+def archive_to_drive(cfg: dict, script_path: Path) -> bool:
+    """Copy a locally-staged script into Drive's processed/ archive.
+
+    A job run stages its script under job-scripts/<id>/ so a retry reuses the
+    exact file, and produces straight from there — it never touches Drive. So
+    since 2026-09-16 every on-demand episode published with no script in the
+    Drive archive: fourteen of them by 09-22, found only because the tower's
+    scripts_archived rule counts published episodes against processed/.
+
+    Writes to processed/, never scripts/. A file landing in scripts/ is what
+    the producer's WatchPaths trigger watches for, so archiving there would
+    queue the episode all over again.
+
+    Best effort by design: a wedged Drive must never fail a finished episode.
+    """
+    try:
+        dest_dir = cfg["drive_gk_daily"] / "scripts" / "processed"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / script_path.name
+        if dest.exists():
+            return True
+        tmp = dest_dir / (script_path.name + ".tmp")
+        tmp.write_text(script_path.read_text())
+        tmp.replace(dest)
+        return True
+    except Exception as exc:
+        say(f"note: script archived locally but not to Drive ({exc})",
+            telegram=False)
+        return False
+
+
 def write_script(cfg: dict, topic: dict) -> Path:
     script = factory.generate(cfg, topic)
     return factory.deliver(cfg, topic, script, stage=False)
@@ -351,6 +382,11 @@ def main() -> int:
         if args.job_id:
             jobs.checkpoint(args.job_id, episode=mp3, title=title)
         say(f"🎧 Rendered: {title}")
+        # The episode exists; put its script in the Drive archive alongside
+        # every other episode's. Only job runs need this — the non-job path
+        # delivered through Drive to begin with.
+        if args.job_id:
+            archive_to_drive(cfg, script_path)
 
         if args.job_id:
             jobs.checkpoint(args.job_id, stage="Uploading to Spotify", phase="upload")
