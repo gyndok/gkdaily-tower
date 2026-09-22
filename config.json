@@ -34,7 +34,10 @@
     "staging_dir": "~/gkdaily-tower/staging",
     "fallback_model": "kimi-k2.6",
     "minibot_env": "~/minibot/.env",
-    "allow_unresearched_fallback": false
+    "allow_unresearched_fallback": false,
+    "request_timeout_seconds": 300,
+    "transient_retries": 2,
+    "web_search_max_uses": 6
   },
   "scout": {
     "run_at": "21:00",

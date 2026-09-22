@@ -120,7 +120,7 @@ studies, guidelines, and named clinicians. Conversational but authoritative — 
 explaining the topic to a smart friend over coffee. Use "you" and "we" \
 naturally, vary sentence length, no jargon without explanation.
 
-Research first: run 6-8 web searches covering different angles (current state, \
+Research first: run up to {searches} web searches covering different angles (current state, \
 how it works, economics, policy/geopolitics, US developments, controversies, \
 future outlook). Prioritize authoritative sources. Build the script on \
 concrete facts — specific numbers, names, dates — not generalities.
@@ -252,8 +252,19 @@ def generate(cfg: dict, topic: dict) -> str:
     try:
         return _finalize(_generate_via_claude(cfg, user_prompt), "claude")
     except Exception as exc:
+        # Keep the cause. This branch used to raise a bare "Live research
+        # unavailable", discarding exc entirely — so a spend cap, a 529, a
+        # network blip and a content-validation failure ("script too short",
+        # "no '# Title' line") all reached Telegram as the same sentence, and
+        # nothing anywhere recorded which had happened. On 2026-09-15 a
+        # wastewater episode died 101 seconds in and the reason was
+        # unrecoverable from any log.
+        log.exception("claude generation failed for %r", topic.get("line", "")[:60])
         if not cfg["factory"].get("allow_unresearched_fallback", False):
-            raise RuntimeError("Live research unavailable; script held instead of publishing unresearched content") from exc
+            raise RuntimeError(
+                "Live research unavailable; script held instead of publishing "
+                f"unresearched content — cause: {type(exc).__name__}: "
+                f"{str(exc)[:200]}") from exc
         log.warning("claude generation failed (%s) — falling back to kimi", exc)
         try:
             tower.telegram(cfg, "⚠️ GK Daily: Claude unavailable for the script "
@@ -276,7 +287,13 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
                or os.environ.get("ANTHROPIC_API_KEY"))
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not found")
-    client = anthropic.Anthropic(api_key=api_key, timeout=900.0)
+    # 900 s meant a stalled stream burned fifteen minutes before failing, and
+    # the job then waited out its own backoff on top — 2026-09-22 cost ~35
+    # minutes of apparent silence across two attempts. A streaming request
+    # that has produced nothing for this long is not going to recover, so fail
+    # fast and retry the round instead.
+    request_timeout = float(cfg["factory"].get("request_timeout_seconds", 300))
+    client = anthropic.Anthropic(api_key=api_key, timeout=request_timeout)
 
     # 2026-09-07 cost audit: every search round re-sends the accumulated
     # results, so max_uses is the main cost lever (10 → 6). Same audit moved
@@ -289,8 +306,16 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
     # on). Sonnet 5's minimum cacheable prefix is 1024 tokens; system+user is
     # comfortably above that.
     cache = {"type": "ephemeral"}
+    # The prompt's search count is substituted from the SAME config value the
+    # tool is given. They drifted before: a 2026-09-07 cost audit cut max_uses
+    # 10 -> 6 while the prompt still said "6-8 web searches", so the model was
+    # told to do more searches than it was allowed and ran out mid-research,
+    # answering with prose instead of a script (2026-09-22, the Lyme episode).
+    max_uses = int(cfg["factory"].get("web_search_max_uses", 6))
     system_blocks = [{"type": "text",
-                      "text": SYSTEM.replace("{words}", str(cfg["factory"]["target_words"])),
+                      "text": (SYSTEM
+                               .replace("{words}", str(cfg["factory"]["target_words"]))
+                               .replace("{searches}", str(max_uses))),
                       "cache_control": cache}]
     user_msg = {"role": "user", "content": [
         {"type": "text", "text": user_prompt, "cache_control": cache}]}
@@ -299,14 +324,30 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
     response = None
     total_in = total_out = total_searches = total_cr = total_cw = 0
     for round_no in range(8):  # server tool loop can pause; resume until done
-        with client.messages.stream(
-            model=cfg["factory"]["model"],
-            max_tokens=32000,
-            system=system_blocks,
-            tools=tools,
-            messages=messages,
-        ) as stream:
-            response = stream.get_final_message()
+        # Retry transient transport faults in place. httpx.ReadTimeout and
+        # "overloaded" are routine on long tool-using turns, and losing the
+        # whole attempt to one means re-running every search already paid for.
+        attempt = 0
+        while True:
+            try:
+                with client.messages.stream(
+                    model=cfg["factory"]["model"],
+                    max_tokens=32000,
+                    system=system_blocks,
+                    tools=tools,
+                    messages=messages,
+                ) as stream:
+                    response = stream.get_final_message()
+                break
+            except (anthropic.APITimeoutError, anthropic.APIConnectionError,
+                    anthropic.InternalServerError) as exc:
+                attempt += 1
+                if attempt > int(cfg["factory"].get("transient_retries", 2)):
+                    raise
+                wait = 5 * attempt
+                log.warning("round %d: %s — retrying in %ds (attempt %d)",
+                            round_no, type(exc).__name__, wait, attempt)
+                time.sleep(wait)
         u = response.usage
         stu = getattr(u, "server_tool_use", None)
         searches = getattr(stu, "web_search_requests", 0) or 0
@@ -326,6 +367,25 @@ def _generate_via_claude(cfg: dict, user_prompt: str) -> str:
         if response.stop_reason == "refusal":
             raise RuntimeError("model declined the request (stop_reason=refusal)")
         if response.stop_reason != "pause_turn":
+            # A turn can end WITHOUT the script: the model exhausts its search
+            # budget and replies "I've hit the search limit for this turn"
+            # (2026-09-22). _finalize then rejects it as "no '# Title' line",
+            # blaming the script format for what is really a research budget.
+            # It has the material by then — ask for the script instead of
+            # throwing the whole round away.
+            text_so_far = "\n".join(b.text for b in response.content
+                                     if b.type == "text")
+            if not re.search(r"^# .+$", text_so_far, re.M) and round_no < 7:
+                log.warning("round %d ended without a title (stop_reason=%s); "
+                            "asking for the script from the research so far",
+                            round_no, response.stop_reason)
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content":
+                                 "No searches remain. Write the COMPLETE script "
+                                 "now from the research you already have, "
+                                 "starting with the '# Title' line and following "
+                                 "every formatting rule. Output only the file."})
+                continue
             break
         messages.append({"role": "assistant", "content": response.content})
     else:
