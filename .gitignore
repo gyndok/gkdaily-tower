@@ -6,6 +6,9 @@ staging/
 # Local runtime state and generated scripts
 jobs.db*
 .jobs.lock
+# notifications.py takes its own lock beside the jobs one; both are
+# runtime state, not source.
+jobs.notifications.lock
 job-scripts/
 
 # Local durable mirror of the Drive queue (see scout.load_queue)
