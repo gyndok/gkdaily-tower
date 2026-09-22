@@ -72,5 +72,6 @@
   "docs_import": {
     "enabled": true,
     "every_min": 30
-  }
+  },
+  "drive_probe_timeout": 25
 }

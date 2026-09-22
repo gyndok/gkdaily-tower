@@ -139,6 +139,7 @@ class Collectors:
         self.cfg = cfg
         self.now = now
         self._rss_cache: tuple[float, list] | None = None
+        self._drive_probe: dict | None = None
 
     _probes = {}
     _probe_lock = threading.Lock()
@@ -169,6 +170,7 @@ class Collectors:
             "ledger": self._guard(self.ledger),
             "launchd": self._guard(self.launchd),
             "drive": self._guard(self.drive),
+            "drive_health": self._guard(self.drive_health),
             "session": self._guard(self.session),
             "substack": self._guard(self.substack),
             "disk": self._guard(self.disk),
@@ -340,10 +342,66 @@ class Collectors:
             return None, None
 
     # -- google drive --------------------------------------------------------
-    def drive(self) -> dict:
+    def drive_health(self) -> dict:
+        """Probe Drive OUT OF PROCESS so a wedged provider cannot hang the tick.
+
+        Google Drive's file provider fails in two ways while the account is
+        perfectly healthy: reads of a dehydrated placeholder hang forever
+        (2026-09-10) and stat() raises OSError EDEADLK, "Resource deadlock
+        avoided" (2026-09-21). Each cost an episode until someone noticed.
+
+        This used to be an inline `gk.is_dir()`, which meant a wedge could
+        hang the whole collection pass — the tower falling silent exactly when
+        it had something worth saying. A bounded subprocess cannot do that:
+        the worst case is a timeout we report as the finding itself.
+        """
+        if self._drive_probe is not None:
+            return self._drive_probe
         gk = self.cfg["drive_gk_daily"]
-        return {"gk_daily_exists": gk.is_dir(),
-                "scripts_exists": (gk / "scripts").is_dir()}
+        probe = (
+            "import sys,time\n"
+            "from pathlib import Path\n"
+            "p=Path(sys.argv[1]); t=time.time()\n"
+            "root=1 if p.is_dir() else 0\n"
+            "sc=p/'scripts'\n"
+            "scripts=1 if sc.is_dir() else 0\n"
+            "n=len(list(sc.glob('*.md'))) if scripts else -1\n"
+            "chars=0\n"
+            "for f in sorted(sc.glob('*.md'))[:1]:\n"
+            "    chars=len(f.read_text(errors='replace'))\n"
+            "print(root,scripts,n,chars,round(time.time()-t,2))\n")
+        limit = self.cfg.get("drive_probe_timeout", 25)
+        try:
+            proc = subprocess.run([sys.executable, "-c", probe, str(gk)],
+                                  capture_output=True, text=True, timeout=limit)
+        except subprocess.TimeoutExpired:
+            self._drive_probe = {"state": "wedged", "seconds": limit,
+                                 "reason": f"no answer in {limit}s — reads are hanging"}
+            return self._drive_probe
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip().splitlines()
+            msg = tail[-1] if tail else f"exit {proc.returncode}"
+            wedged = "deadlock" in msg.lower() or "errno 11" in msg.lower()
+            self._drive_probe = {"state": "wedged" if wedged else "error",
+                                 "reason": msg[:170]}
+            return self._drive_probe
+        try:
+            root, scripts, pending, chars, secs = (proc.stdout or "").split()
+            self._drive_probe = {
+                "state": "ok" if root == "1" and scripts == "1" else "missing",
+                "gk_daily_exists": root == "1", "scripts_exists": scripts == "1",
+                "pending_md": int(pending), "sample_chars": int(chars),
+                "seconds": float(secs)}
+        except ValueError:
+            self._drive_probe = {"state": "error",
+                                 "reason": f"unparseable probe output: {(proc.stdout or '')[:80]!r}"}
+        return self._drive_probe
+
+    def drive(self) -> dict:
+        # Derived from the bounded probe — never touches Drive inline.
+        h = self.drive_health()
+        return {"gk_daily_exists": h.get("gk_daily_exists", False),
+                "scripts_exists": h.get("scripts_exists", False)}
 
     # -- spotify session freshness -------------------------------------------
     def session(self) -> dict:
@@ -389,11 +447,18 @@ class Collectors:
             slug, date = m.group(1), m.group(2)
             if slug in have:
                 continue
-            # recoverable if the rendered text survives locally
-            txt = (self.cfg["podcasts_root"] / "special-editions" / slug
-                   / "script.txt")
+            # Recoverable while the rendered text survives locally. Check
+            # BOTH workspaces: the pipeline moved from special-editions/ to
+            # work-specials/, and checking only the old path reported 14
+            # perfectly recoverable episodes as lost on 2026-09-22 — the
+            # tower crying wolf about its own stale assumption.
+            root = self.cfg["podcasts_root"]
+            recoverable = any(
+                (root / workspace / slug / name).is_file()
+                for workspace in ("work-specials", "special-editions")
+                for name in ("script.txt", f"{date}_{slug}.md"))
             missing.append({"slug": slug, "date": date,
-                            "recoverable": txt.is_file()})
+                            "recoverable": recoverable})
         missing.sort(key=lambda x: x["date"])
         return {"episodes": len(meta), "missing": missing}
 
@@ -682,6 +747,25 @@ def evaluate(cfg: dict, col: Collectors, data: dict, now: datetime) -> list:
                     f"oldest {miss[0]['date']} {miss[0]['slug']}; "
                     f"{len(lost)} unrecoverable" if miss else
                     f"all {sa.get('episodes', 0)} episodes have a script"))
+
+    # 9d. the Google Drive file provider itself (red — no script can be read).
+    # Distinct from volumes_mounted, which watches the T7 episode archive.
+    dh = data["drive_health"]
+    if "error" in dh:
+        add("drive_responsive", "Google Drive responsive", None, now,
+            severity="red", detail=f"probe failed: {str(dh['error'])[:90]}")
+    else:
+        state = dh.get("state")
+        add("drive_responsive", "Google Drive responsive", state == "ok", now,
+            severity="red",
+            detail=(f"wedged — {dh.get('reason', 'unresponsive')}; scripts cannot "
+                    "be read locally, the pipeline falls back to the Drive API"
+                    if state == "wedged" else
+                    ("GK Daily folder not visible — Drive answered but the "
+                     "folder is gone or not synced") if state == "missing" else
+                    f"probe error — {dh.get('reason', '')[:90]}" if state == "error" else
+                    f"responded in {dh.get('seconds')}s, "
+                    f"{dh.get('pending_md')} script(s) pending"))
 
     # 10. external volumes backing the pipeline (red — nothing can render)
     vol = data["volumes"]
