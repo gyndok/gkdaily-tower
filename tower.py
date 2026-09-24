@@ -1003,6 +1003,129 @@ def maybe_substack_upload(cfg: dict, conn, now: datetime, data: dict) -> None:
     log.info("substack auto-upload started for %d pending special(s)", len(due))
 
 
+# ------------------------------------------------ special-editions.md --
+
+def _episode_key(title: str) -> str:
+    """Normalise a title to its main clause, for matching across sources.
+
+    The same episode is written three ways: the mini's metadata ("GK Daily
+    Special Edition: Microplastics and Human Health — What We Actually Know"),
+    the feed ("GK Daily Special Edition: Microplastics Human Health") and the
+    master list, which sometimes truncates a subtitle or appends a "(subject
+    tag)". The clause before the first em dash is the stable part.
+    """
+    t = re.sub(r"^GK Daily Special Edition[:—\s-]*", "", title or "", flags=re.I)
+    t = re.split(r"\s+—\s+|\s+\(", t, maxsplit=1)[0]
+    return re.sub(r"[^a-z0-9]", "", t.lower())
+
+
+def _topic_tag(name: str) -> str:
+    """The on-demand request that produced an episode, as a subject tag.
+
+    Titles are written to intrigue ("The Vaccine We Threw Away"), not to name
+    their subject, and the subject is what the scout's duplicate check reads.
+    The MacBook tags its lines by hand for that reason; the mini can recover
+    the same thing from the job that made the episode.
+    """
+    try:
+        c = sqlite3.connect(BASE_DIR / "jobs.db")
+        for req, ck in c.execute("SELECT request, checkpoint FROM jobs WHERE status='done'"):
+            if json.loads(ck or "{}").get("episode") == name:
+                topic = (json.loads(req or "{}").get("topic") or "").strip()
+                return re.split(r"\s+—\s+", topic, maxsplit=1)[0][:70]
+    except Exception:
+        pass
+    return ""
+
+
+def maybe_record_published(cfg: dict, conn, now: datetime) -> list[str]:
+    """Add the mini's newly published episodes to special-editions.md.
+
+    That file is the cross-machine do-not-repeat list the Topic Scout reads.
+    The MacBook appends its own episodes and periodically re-syncs the whole
+    file from the public feed; between syncs, anything the mini published was
+    invisible to it. This closes that gap.
+
+    Rules, from tower-dedupe-instructions.md and from the file itself:
+      * mini episodes only, from its own metadata + upload ledger — the
+        MacBook's audio/ledger.json is never read or written here;
+      * only recent publishes (window_days), so a historical episode the file
+        lists under a different title is never re-added as a duplicate — the
+        08-21 microplastics episode is exactly that case;
+      * the file is newest-first, so a new line goes in at its date position,
+        not at the end;
+      * everything else in the file is preserved byte-for-byte, and the write
+        is atomic: full text to a temp file beside it, then rename.
+
+    mode "dry-run" (the default) logs what it would insert and writes nothing.
+    """
+    cfg_s = cfg.get("special_editions_md", {})
+    mode = cfg_s.get("mode", "dry-run")
+    if mode == "off":
+        return []
+    conn.execute("CREATE TABLE IF NOT EXISTS se_md_sync (ts TEXT, added TEXT)")
+    last = conn.execute("SELECT MAX(ts) FROM se_md_sync").fetchone()[0]
+    if last and (now - datetime.fromisoformat(last)).total_seconds() / 60 < cfg_s.get("every_min", 30):
+        return []
+    conn.execute("INSERT INTO se_md_sync VALUES (?,?)", (now.isoformat(timespec="seconds"), ""))
+    conn.commit()
+
+    path = cfg["drive_gk_daily"] / "special-editions.md"
+    try:
+        text = path.read_text()
+        meta = json.loads((cfg["podcasts_root"] / "public/episodes/special_editions.json").read_text())
+        ledger = json.loads((cfg["podcasts_root"] / "config/spotify_uploaded.json").read_text())
+    except Exception as exc:
+        log.warning("special-editions.md sync skipped (%s)", exc)
+        return []
+
+    lines = text.split("\n")
+    present = {_episode_key(m.group(1)) for l in lines
+               if (m := re.match(r"^\d{4}-\d{2}-\d{2}\s+—\s+(.+)$", l))}
+    horizon = (now - timedelta(days=cfg_s.get("window_days", 7))).date()
+    new_entries = []
+    for name, info in meta.items():
+        stamp = ledger.get(name, "")
+        if not stamp or "UNVERIFIED" in stamp:
+            continue                                  # not confirmed published
+        try:
+            pub = datetime.fromisoformat(stamp.split(" ")[0]).date()
+        except ValueError:
+            continue
+        if pub < horizon:
+            continue
+        title = re.sub(r"^GK Daily Special Edition[:—\s-]*", "", info.get("title", "")).strip()
+        if not title or _episode_key(title) in present:
+            continue
+        tag = _topic_tag(name)
+        entry = f"{pub.isoformat()} — {title}" + (f" ({tag})" if tag else "")
+        new_entries.append((pub.isoformat(), entry))
+        present.add(_episode_key(title))
+    if not new_entries:
+        return []
+
+    for date, entry in sorted(new_entries, reverse=True):
+        idx = next((i for i, l in enumerate(lines)
+                    if re.match(r"^\d{4}-\d{2}-\d{2}\s+—", l) and l[:10] < date), None)
+        if idx is None:                               # older than all: after the last entry
+            idx = max((i for i, l in enumerate(lines) if re.match(r"^\d{4}-\d{2}-\d{2}\s+—", l)),
+                      default=len(lines) - 1) + 1
+        lines.insert(idx, entry)
+
+    added = [e for _, e in new_entries]
+    if mode != "on":
+        log.info("special-editions.md (dry-run) would add: %s", " | ".join(added))
+        return added
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(lines))
+    os.replace(tmp, path)
+    conn.execute("UPDATE se_md_sync SET added=? WHERE ts=(SELECT MAX(ts) FROM se_md_sync)",
+                 (" | ".join(added),))
+    conn.commit()
+    log.info("special-editions.md: added %s", " | ".join(added))
+    return added
+
+
 # ----------------------------------------------------------- stray Docs --
 
 def maybe_import_stray_docs(cfg: dict, conn, now: datetime) -> None:
@@ -1180,6 +1303,12 @@ def tick(cfg: dict, conn: sqlite3.Connection, quiet: bool = False) -> dict:
             maybe_nudge_producer(cfg, conn, now, data)
         except Exception:
             log.exception("producer nudge failed")
+
+    if not quiet:  # keep the cross-machine do-not-repeat list current
+        try:
+            maybe_record_published(cfg, conn, now)
+        except Exception:
+            log.exception("special-editions.md sync failed")
 
     if not quiet:  # rescue scripts saved as Google Docs instead of .md files
         try:
