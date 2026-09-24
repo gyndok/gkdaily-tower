@@ -53,7 +53,7 @@
       "health": "https://news.google.com/rss/headlines/section/topic/HEALTH?hl=en-US&gl=US&ceid=US:en",
       "business": "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en"
     },
-    "subject_dedupe": "dry-run"
+    "subject_dedupe": "on"
   },
   "media_retention_days": 14,
   "substack": {
@@ -79,7 +79,7 @@
   },
   "drive_probe_timeout": 25,
   "special_editions_md": {
-    "mode": "dry-run",
+    "mode": "on",
     "window_days": 7,
     "every_min": 30
   }
